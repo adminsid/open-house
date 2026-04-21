@@ -474,13 +474,14 @@ app.get('/', async (c) => {
 // Auth Routes
 // ---------------------------------------------------------------------------
 
-app.get('/login', (c) => {
-  const body = `
+function loginForm(error?: string): string {
+  return `
 <div class="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
   <div class="max-w-md w-full space-y-8 bg-white p-10 rounded-2xl shadow-xl">
     <div>
       <h2 class="mt-6 text-center text-3xl font-extrabold text-gray-900 font-serif tracking-tight">Sign in to Admin</h2>
     </div>
+    ${error ? `<p class="text-red-600 text-sm text-center font-medium">${escHtml(error)}</p>` : ''}
     <form class="mt-8 space-y-6" action="/login" method="POST">
       <div class="rounded-md shadow-sm space-y-4">
         <div>
@@ -500,7 +501,10 @@ app.get('/login', (c) => {
     </form>
   </div>
 </div>`;
-  return c.html(pageShell('Login', body));
+}
+
+app.get('/login', (c) => {
+  return c.html(pageShell('Login', loginForm()));
 });
 
 app.post('/login', async (c) => {
