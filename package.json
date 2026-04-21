@@ -6,7 +6,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:migrate": "wrangler d1 execute open-house-db --file=./migrations/001_schema.sql",
-    "db:migrate:002": "wrangler d1 execute open-house-db --file=./migrations/002_branding.sql"
+    "db:migrate:002": "wrangler d1 execute open-house-db --file=./migrations/002_branding.sql",
+    "db:migrate:003": "wrangler d1 execute open-house-db --file=./migrations/003_auth_and_management.sql"
   },
   "dependencies": {
     "hono": "^4.6.0"

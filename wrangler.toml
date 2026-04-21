@@ -22,4 +22,5 @@ custom_domain = true
 
 [vars]
 ADMIN_SECRET = "change-this-secret-in-production"
+JWT_SECRET = "super-secret-jwt-key-replace-in-prod"
 APP_URL = "https://openhouse.primeamericarealestate.com"
