@@ -331,7 +331,7 @@ app.use('/admin*', async (c, next) => {
   }
   
   try {
-    const payload = await verify(token, c.env.JWT_SECRET) as any;
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256') as any;
     if (!payload || !payload.id) throw new Error('Invalid payload structure');
     c.set('user', payload);
     await next();
@@ -353,7 +353,7 @@ app.use('/super*', async (c, next) => {
   }
   
   try {
-    const payload = await verify(token, c.env.JWT_SECRET) as any;
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256') as any;
     if (!payload || !payload.id) throw new Error('Invalid payload structure');
     if (payload.role !== 'superuser') {
       console.warn(`Super Middleware [${path}]: User ${payload.email} is not a superuser, forbidden`);
@@ -708,7 +708,7 @@ app.get('/', async (c) => {
   const token = getCookie(c, 'auth_token');
   if (token) {
     try {
-      const payload = await verify(token, c.env.JWT_SECRET) as any;
+      const payload = await verify(token, c.env.JWT_SECRET, 'HS256') as any;
       if (payload.role === 'superuser') return c.redirect('/super');
       return c.redirect('/admin');
     } catch (e) {
