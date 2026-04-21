@@ -490,8 +490,8 @@ app.post('/admin/events/new', async (c) => {
   }
 
   const id = generateId();
-  const admin_token = generateToken(16); // 32-char hex
-  const public_token = generateToken(8); // 16-char hex
+  const admin_token = generateToken(16); // 16 bytes → 32-char hex
+  const public_token = generateToken(8);  // 8 bytes → 16-char hex
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
@@ -762,9 +762,12 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  // Delete old photo if exists
+  // Delete old photo if exists; ignore NotFound errors, re-throw others
   if (event.photo_key) {
-    await c.env.BUCKET.delete(event.photo_key).catch(() => null);
+    await c.env.BUCKET.delete(event.photo_key).catch((err: unknown) => {
+      if (err instanceof Error && err.message.includes('NoSuchKey')) return;
+      console.error('R2 delete error:', err);
+    });
   }
 
   const ext = file.name.split('.').pop() ?? 'jpg';
@@ -872,10 +875,10 @@ function eventFormFields(ev?: Event): string {
     'Asia/Tokyo',
   ];
   const tzOptions = timezones
-    .map(
-      (tz) =>
-        `<option value="${tz}" ${ev?.timezone === tz ? 'selected' : tz === 'America/New_York' && !ev ? 'selected' : ''}>${tz}</option>`
-    )
+    .map((tz) => {
+      const isSelected = ev ? ev.timezone === tz : tz === 'America/New_York';
+      return `<option value="${tz}" ${isSelected ? 'selected' : ''}>${tz}</option>`;
+    })
     .join('');
 
   // Convert stored ISO times to datetime-local format for the input
