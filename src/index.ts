@@ -319,35 +319,42 @@ app.onError((err, c) => {
 // Root redirect & Middleware
 // ---------------------------------------------------------------------------
 
+// Unified auth middleware for both admin and super routes
 app.use('/admin*', async (c, next) => {
-  if (c.req.path === '/admin/login') return await next();
+  const path = c.req.path;
+  if (path.includes('/login')) return await next();
+  
   const token = getCookie(c, 'auth_token');
-  console.log(`Admin Middleware [${c.req.path}]: token present?`, !!token);
   if (!token) return c.redirect('/login');
+  
   try {
-    const payload = await verify(token, c.env.JWT_SECRET);
-    console.log('Admin Middleware: verify success, role:', payload.role);
-    c.set('user', payload as any);
+    const payload = await verify(token, c.env.JWT_SECRET) as any;
+    if (!payload || !payload.id) throw new Error('Invalid payload');
+    c.set('user', payload);
     await next();
   } catch (e) {
-    console.error('Admin Middleware: verify failed', e);
+    console.error(`Auth failure on ${path}:`, e);
+    deleteCookie(c, 'auth_token', { path: '/' });
     return c.redirect('/login');
   }
 });
 
 app.use('/super*', async (c, next) => {
-  if (c.req.path === '/super/login') return await next();
+  const path = c.req.path;
+  if (path.includes('/login')) return await next();
+  
   const token = getCookie(c, 'auth_token');
-  console.log(`Super Middleware [${c.req.path}]: token present?`, !!token);
   if (!token) return c.redirect('/super/login');
+  
   try {
-    const payload = await verify(token, c.env.JWT_SECRET);
-    console.log('Super Middleware: verify success, role:', payload.role);
-    if (payload.role !== 'superuser') return c.text('Unauthorized', 403);
-    c.set('user', payload as any);
+    const payload = await verify(token, c.env.JWT_SECRET) as any;
+    if (!payload || !payload.id) throw new Error('Invalid payload');
+    if (payload.role !== 'superuser') return c.text('Forbidden: Superuser access required', 403);
+    c.set('user', payload);
     await next();
   } catch (e) {
-    console.error('Super Middleware: verify failed', e);
+    console.error(`Super Auth failure on ${path}:`, e);
+    deleteCookie(c, 'auth_token', { path: '/' });
     return c.redirect('/super/login');
   }
 });
@@ -684,12 +691,51 @@ app.post('/super/users', async (c) => {
 });
 
 app.post('/super/users/:id/delete', async (c) => {
-  const id = c.req.param('id');
-  const user = c.get('user') as any;
-  if (user.id === id) return c.text('Cannot delete yourself', 400);
+  const targetId = c.req.param('id');
+  const user = c.get('user');
+  if (!user || !user.id) return c.redirect('/super/login');
+  
+  if (user.id === targetId) return c.text('Cannot delete yourself', 400);
 
-  await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
+  await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(targetId).run();
   return c.redirect('/super');
+});
+
+app.get('/super/settings', async (c) => {
+  const user = c.get('user');
+  if (!user) return c.redirect('/super/login');
+  
+  const body = `
+${adminNav(c)}
+<div class="max-w-4xl mx-auto px-4 py-10 space-y-8">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-900 mb-2">Superuser Settings</h1>
+    <p class="text-gray-500">Global system configuration and master controls.</p>
+  </div>
+  
+  <div class="bg-white rounded-2xl shadow p-6 border border-indigo-100">
+    <h2 class="text-lg font-semibold text-gray-900 mb-4">System Information</h2>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 text-sm">
+      <div class="p-4 bg-gray-50 rounded-xl">
+        <p class="text-gray-500 mb-1">Your ID</p>
+        <p class="font-mono text-xs break-all">${user.id}</p>
+      </div>
+      <div class="p-4 bg-gray-50 rounded-xl">
+        <p class="text-gray-500 mb-1">Role</p>
+        <p class="font-bold text-indigo-600 uppercase tracking-wider">${user.role}</p>
+      </div>
+    </div>
+  </div>
+  
+  <div class="bg-red-50 rounded-2xl p-6 border border-red-100">
+    <h2 class="text-lg font-semibold text-red-900 mb-2">Danger Zone</h2>
+    <p class="text-red-700 text-sm mb-4">These actions affect the entire platform.</p>
+    <div class="flex gap-4">
+      <a href="/logout" class="bg-red-600 text-white font-bold px-6 py-2 rounded-lg hover:bg-red-700 shadow-sm">Global Logout</a>
+    </div>
+  </div>
+</div>`;
+  return c.html(pageShell('Super Settings', body));
 });
 
 // ---------------------------------------------------------------------------
@@ -2100,17 +2146,17 @@ function copyText(id) {
 // ---------------------------------------------------------------------------
 
 app.get('/admin/settings', async (c) => {
-  try {
-    const user = c.get('user') as any;
-    console.log('GET /admin/settings - User:', JSON.stringify(user));
-    
-    const company = await c.env.DB.prepare('SELECT * FROM companies WHERE id = (SELECT company_id FROM users WHERE id = ?)')
-      .bind(user.id)
-      .first<Company>();
-    
-    console.log('GET /admin/settings - Company:', JSON.stringify(company));
+  const user = c.get('user');
+  if (!user || !user.id) return c.redirect('/login');
+  
+  // Superusers should go to their own settings
+  if (user.role === 'superuser') return c.redirect('/super/settings');
 
-    const body = `
+  const company = await c.env.DB.prepare('SELECT * FROM companies WHERE id = (SELECT company_id FROM users WHERE id = ?)')
+    .bind(user.id)
+    .first<Company>();
+
+  const body = `
 ${adminNav(c)}
 <div class="max-w-2xl mx-auto px-4 py-10">
   <h1 class="text-2xl font-bold text-gray-900 mb-6">Company Branding<\/h1>
@@ -2134,10 +2180,6 @@ ${adminNav(c)}
   <\/div>
 <\/div>`;
     return c.html(pageShell('Settings', body));
-  } catch (err: any) {
-    console.error('Error in GET /admin/settings:', err);
-    throw err;
-  }
 });
 
 app.post('/admin/settings', async (c) => {
