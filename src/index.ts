@@ -322,41 +322,43 @@ app.onError((err, c) => {
 // Unified auth middleware for both admin and super routes
 app.use('/admin*', async (c, next) => {
   const path = c.req.path;
-  if (path.includes('/login')) return await next();
+  if (path.includes('/login') || path.includes('/logout')) return await next();
   
   const token = getCookie(c, 'auth_token');
-  console.log(`Admin Middleware [${path}]: token? ${!!token}`);
-  if (!token) return c.redirect('/login');
+  if (!token) {
+    console.log(`Admin Middleware [${path}]: No token found, redirecting to /login`);
+    return c.redirect('/login');
+  }
   
   try {
     const payload = await verify(token, c.env.JWT_SECRET) as any;
-    if (!payload || !payload.id) throw new Error('Invalid payload');
-    console.log(`Admin Middleware: user ${payload.email} (${payload.role})`);
+    if (!payload || !payload.id) throw new Error('Invalid payload structure');
     c.set('user', payload);
     await next();
   } catch (e) {
-    console.error(`Auth failure on ${path}:`, e);
-    // Don't delete cookie yet, maybe it's just a transient error or wrong route
+    console.error(`Admin Auth failure on ${path}:`, e);
+    // If verify fails, the token might be expired or the secret changed
     return c.redirect('/login');
   }
 });
 
 app.use('/super*', async (c, next) => {
   const path = c.req.path;
-  if (path.includes('/login')) return await next();
+  if (path.includes('/login') || path.includes('/logout')) return await next();
   
   const token = getCookie(c, 'auth_token');
-  console.log(`Super Middleware [${path}]: token? ${!!token}`);
-  if (!token) return c.redirect('/super/login');
+  if (!token) {
+    console.log(`Super Middleware [${path}]: No token found, redirecting to /super/login`);
+    return c.redirect('/super/login');
+  }
   
   try {
     const payload = await verify(token, c.env.JWT_SECRET) as any;
-    if (!payload || !payload.id) throw new Error('Invalid payload');
+    if (!payload || !payload.id) throw new Error('Invalid payload structure');
     if (payload.role !== 'superuser') {
-      console.warn(`Forbidden: ${payload.email} tried to access super route`);
+      console.warn(`Super Middleware [${path}]: User ${payload.email} is not a superuser, forbidden`);
       return c.text('Forbidden: Superuser access required', 403);
     }
-    console.log(`Super Middleware: user ${payload.email}`);
     c.set('user', payload);
     await next();
   } catch (e) {
@@ -506,34 +508,25 @@ app.post('/login', async (c) => {
   const email = (form.get('email') as string)?.trim().toLowerCase();
   const password = form.get('password') as string;
 
-  console.log('Login attempt for:', email);
   const user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?')
     .bind(email)
     .first<User>();
 
-  if (!user) {
-    console.log('Login failed: User not found');
-    return c.html(pageShell('Login', `<div class="p-8 text-center"><p class="text-red-500 mb-4">Invalid email or password.</p><a href="/login" class="text-indigo-600 underline">Try again</a></div>`));
-  }
-
-  const isMatch = await verifyPassword(password, user.password_hash);
-  console.log('Password match?', isMatch);
-
-  if (!isMatch) {
-    return c.html(pageShell('Login', `<div class="p-8 text-center"><p class="text-red-500 mb-4">Invalid email or password.</p><a href="/login" class="text-indigo-600 underline">Try again</a></div>`));
+  if (!user || !(await verifyPassword(password, user.password_hash))) {
+    return c.html(pageShell('Login', loginForm('Invalid email or password')), 401);
   }
 
   const token = await sign({ id: user.id, email: user.email, role: user.role }, c.env.JWT_SECRET);
-  console.log('Login success: Setting auth_token cookie');
   setCookie(c, 'auth_token', token, {
+    path: '/',
     httpOnly: true,
     secure: true,
     sameSite: 'Lax',
-    path: '/',
-    maxAge: 60 * 60 * 24, // 24 hours
+    maxAge: 60 * 60 * 24 * 7, // 7 days
   });
 
-  return c.redirect(user.role === 'superuser' ? '/super' : '/admin');
+  if (user.role === 'superuser') return c.redirect('/super');
+  return c.redirect('/admin');
 });
 
 app.get('/super/login', (c) => {
@@ -756,6 +749,27 @@ ${adminNav(c)}
   </div>
 </div>`;
   return c.html(pageShell('Super Settings', body));
+});
+
+app.get('/super/debug', async (c) => {
+  const user = c.get('user');
+  const token = getCookie(c, 'auth_token');
+  
+  const body = `
+${adminNav(c)}
+<div class="max-w-4xl mx-auto px-4 py-10">
+  <h1 class="text-2xl font-bold mb-6">Auth Debug</h1>
+  <div class="bg-white p-6 rounded-xl shadow space-y-4 font-mono text-sm">
+    <p><strong>Role:</strong> ${user?.role}</p>
+    <p><strong>Email:</strong> ${user?.email}</p>
+    <p><strong>Token Present:</strong> ${!!token}</p>
+    <div class="p-4 bg-gray-50 rounded border">
+      <p class="mb-2"><strong>Payload:</strong></p>
+      <pre>${JSON.stringify(user, null, 2)}</pre>
+    </div>
+  </div>
+</div>`;
+  return c.html(pageShell('Debug', body));
 });
 
 // ---------------------------------------------------------------------------
