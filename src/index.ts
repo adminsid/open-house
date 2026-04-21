@@ -264,14 +264,23 @@ function guestPageShell(title: string, body: string): string {
 
 function adminNav(c: any, extra = ''): string {
   const user = c.get('user');
+  
   return `<nav class="bg-white shadow-sm border-b border-gray-200">
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between h-14">
       <div class="flex items-center gap-6">
         <a href="/admin" class="text-indigo-600 font-bold text-lg tracking-tight">🏠 Open House Admin</a>
-        ${user?.role === 'superuser' ? `<a href="/super" class="text-gray-600 text-sm hover:text-indigo-600">Super Dashboard</a>` : ''}
+        ${user?.role === 'superuser' ? `<a href="/super" class="text-gray-600 text-sm hover:text-indigo-600 font-medium bg-gray-50 px-2 py-1 rounded">Super Dashboard</a>` : ''}
+        <a href="/admin/settings" class="text-gray-600 text-sm hover:text-indigo-600">Settings</a>
       </div>
       <div class="flex items-center gap-4">
-        ${user ? `<span class="text-xs text-gray-400">${user.email}</span><a href="/logout" class="text-xs text-red-500 hover:underline">Logout</a>` : ''}
+        ${user ? `
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-gray-500 hidden sm:inline">${user.email}</span>
+            <a href="/logout" class="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-bold rounded-lg text-white bg-red-600 hover:bg-red-700 transition-all shadow-sm">
+              Sign Out
+            </a>
+          </div>
+        ` : ''}
         ${extra}
       </div>
     </div>
@@ -1018,17 +1027,22 @@ app.get('/e/:token/success', async (c) => {
 // ---------------------------------------------------------------------------
 
 app.get('/admin', async (c) => {
+  const user = c.get('user') as any;
+  if (!user || !user.id) return c.redirect('/login');
+
   const events = await c.env.DB.prepare(
-    'SELECT * FROM events ORDER BY start_time DESC'
-  ).all<Event>();
+    'SELECT * FROM events WHERE user_id = ? ORDER BY start_time DESC'
+  ).bind(user.id).all<Event>();
 
   const now = new Date();
   const filter = c.req.query('filter') ?? 'all';
 
-  const allEvents = (events.results ?? []).map((ev) => ({
-    ev,
-    liveStatus: getEventStatus(ev, now),
-  }));
+  const allEvents = (events.results ?? [])
+    .filter(ev => ev && typeof ev === 'object')
+    .map((ev) => ({
+      ev,
+      liveStatus: getEventStatus(ev, now),
+    }));
 
   const filtered =
     filter === 'all'
@@ -1187,6 +1201,10 @@ app.post('/admin/events/new', async (c) => {
   }
 
   const user = c.get('user') as any;
+  if (!user || !user.id) {
+    console.error('POST /admin/events/new - No user in context');
+    return c.redirect('/login');
+  }
   const id = generateId();
   const admin_token = generateToken(16);
   const public_token = generateToken(16);
