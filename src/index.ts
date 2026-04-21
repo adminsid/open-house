@@ -307,25 +307,31 @@ const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 app.use('/admin/*', async (c, next) => {
   const token = getCookie(c, 'auth_token');
+  console.log('Admin Middleware: token present?', !!token);
   if (!token) return c.redirect('/login');
   try {
     const payload = await verify(token, c.env.JWT_SECRET);
+    console.log('Admin Middleware: verify success, role:', payload.role);
     c.set('user', payload as any);
     await next();
-  } catch {
+  } catch (e) {
+    console.error('Admin Middleware: verify failed', e);
     return c.redirect('/login');
   }
 });
 
 app.use('/super/*', async (c, next) => {
   const token = getCookie(c, 'auth_token');
+  console.log('Super Middleware: token present?', !!token);
   if (!token) return c.redirect('/login');
   try {
     const payload = await verify(token, c.env.JWT_SECRET);
+    console.log('Super Middleware: verify success, role:', payload.role);
     if (payload.role !== 'superuser') return c.text('Unauthorized', 403);
     c.set('user', payload as any);
     await next();
-  } catch {
+  } catch (e) {
+    console.error('Super Middleware: verify failed', e);
     return c.redirect('/login');
   }
 });
@@ -471,19 +477,30 @@ app.post('/login', async (c) => {
   const email = (form.get('email') as string)?.trim().toLowerCase();
   const password = form.get('password') as string;
 
+  console.log('Login attempt for:', email);
   const user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?')
     .bind(email)
     .first<User>();
 
-  if (!user || !(await verifyPassword(password, user.password_hash))) {
+  if (!user) {
+    console.log('Login failed: User not found');
+    return c.html(pageShell('Login', `<div class="p-8 text-center"><p class="text-red-500 mb-4">Invalid email or password.</p><a href="/login" class="text-indigo-600 underline">Try again</a></div>`));
+  }
+
+  const isMatch = await verifyPassword(password, user.password_hash);
+  console.log('Password match?', isMatch);
+
+  if (!isMatch) {
     return c.html(pageShell('Login', `<div class="p-8 text-center"><p class="text-red-500 mb-4">Invalid email or password.</p><a href="/login" class="text-indigo-600 underline">Try again</a></div>`));
   }
 
   const token = await sign({ id: user.id, email: user.email, role: user.role }, c.env.JWT_SECRET);
+  console.log('Login success: Setting auth_token cookie');
   setCookie(c, 'auth_token', token, {
     httpOnly: true,
     secure: true,
     sameSite: 'Lax',
+    path: '/',
     maxAge: 60 * 60 * 24, // 24 hours
   });
 
