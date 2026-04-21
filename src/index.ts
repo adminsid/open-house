@@ -339,14 +339,14 @@ app.get('/e/:token', async (c) => {
             <\/div>
           <\/div>
           <div>
-            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Email Address <span class="text-red-400">*<\/span><\/label>
-            <input type="email" name="email" required
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Email Address<\/label>
+            <input type="email" name="email"
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
               placeholder="jane@example.com" \/>
           <\/div>
           <div>
-            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Phone Number<\/label>
-            <input type="tel" name="phone"
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Phone Number <span class="text-red-400">*<\/span><\/label>
+            <input type="tel" name="phone" required
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
               placeholder="(555) 000-0000" \/>
           <\/div>
@@ -449,9 +449,9 @@ app.post('/e/:token/signin', async (c) => {
   const form = await c.req.formData();
   const firstName = (form.get('first_name') as string | null)?.trim() ?? '';
   const lastName = (form.get('last_name') as string | null)?.trim() ?? '';
-  const email = (form.get('email') as string | null)?.trim() ?? '';
+  const phone = (form.get('phone') as string | null)?.trim() ?? '';
 
-  if (!firstName || !lastName || !email) {
+  if (!firstName || !lastName || !phone) {
     return c.html(
       guestPageShell(
         'Error',
@@ -459,7 +459,7 @@ app.post('/e/:token/signin', async (c) => {
           <div class="glass-card rounded-2xl shadow-xl p-8 max-w-sm w-full text-center">
             <div class="text-4xl mb-4">&#9888;&#65039;<\/div>
             <h1 class="text-lg font-bold text-gray-900 mb-2">Missing Required Fields<\/h1>
-            <p class="text-gray-500 text-sm mb-5">Please fill in your first name, last name, and email.<\/p>
+            <p class="text-gray-500 text-sm mb-5">Please fill in your first name, last name, and phone number.<\/p>
             <a href="/e/${escHtml(token)}" class="btn-gold inline-block px-6 py-2.5 rounded-xl text-sm font-bold">Go Back<\/a>
           <\/div>
         <\/div>`
@@ -468,7 +468,7 @@ app.post('/e/:token/signin', async (c) => {
     );
   }
 
-  const phone = (form.get('phone') as string | null)?.trim() || null;
+  const email = (form.get('email') as string | null)?.trim() || null;
   const address = (form.get('address') as string | null)?.trim() || null;
   const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const howDidYouHear = (form.get('how_did_you_hear') as string | null)?.trim() || null;
