@@ -6,11 +6,11 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "open-house-db"
-database_id = "placeholder-replace-with-actual-id"
+database_id = "11c2a9d3-64c5-4f87-902c-1a7b422b9cd0"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "placeholder-replace-with-actual-id"
+id = "1f8e09cbac794744a208e6b15a0dcaaa"
 
 [[r2_buckets]]
 binding = "BUCKET"
