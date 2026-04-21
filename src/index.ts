@@ -104,7 +104,8 @@ function followUpBadge(status: string): string {
     closed: 'bg-purple-100 text-purple-800',
   };
   const cls = map[status] ?? 'bg-gray-100 text-gray-700';
-  return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}">${status.replace(/_/g, ' ')}</span>`;
+  const label = status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}">${label}</span>`;
 }
 
 function formatDateTime(iso: string, timezone: string): string {
@@ -279,7 +280,7 @@ app.get('/e/:token', async (c) => {
     .map((p) => p[0] ?? '')
     .join('')
     .slice(0, 2)
-    .toUpperCase();
+    .toUpperCase() || '??';
 
   const isCancelled = liveStatus === 'cancelled';
 
@@ -510,7 +511,7 @@ app.get('/e/:token/success', async (c) => {
     .map((p) => p[0] ?? '')
     .join('')
     .slice(0, 2)
-    .toUpperCase();
+    .toUpperCase() || '??';
 
   const body = `
 <div style="background-color:var(--navy);min-height:100vh">
@@ -1204,7 +1205,8 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
   )
     .bind(
       newId,
-      `${source.title} (Copy)`,
+      // Strip existing "(Copy)" suffix to avoid "Event (Copy) (Copy) (Copy)..." stacking
+      `${source.title.replace(/\s*\(Copy\)\s*$/, '').trim()} (Copy)`,
       source.property_address,
       source.agent_name,
       source.agent_email,
@@ -1215,8 +1217,9 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
       source.end_time,
       source.timezone,
       source.listing_url,
-      source.photo_key,
-      source.agent_photo_key,
+      // Do not copy R2 photo keys — deleted originals would break the duplicate's images
+      null,
+      null,
       newAdminToken,
       newPublicToken,
       now,
@@ -1287,7 +1290,7 @@ app.get('/agent/:adminToken', async (c) => {
     .map((p) => p[0] ?? '')
     .join('')
     .slice(0, 2)
-    .toUpperCase();
+    .toUpperCase() || '??';
 
   const guestCount = (guests.results ?? []).length;
   const pendingCount = (guests.results ?? []).filter((g) => g.follow_up_status === 'pending').length;
