@@ -305,9 +305,10 @@ const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 // Root redirect & Middleware
 // ---------------------------------------------------------------------------
 
-app.use('/admin/*', async (c, next) => {
+app.use('/admin*', async (c, next) => {
+  if (c.req.path === '/admin/login') return await next();
   const token = getCookie(c, 'auth_token');
-  console.log('Admin Middleware: token present?', !!token);
+  console.log(`Admin Middleware [${c.req.path}]: token present?`, !!token);
   if (!token) return c.redirect('/login');
   try {
     const payload = await verify(token, c.env.JWT_SECRET);
@@ -320,10 +321,11 @@ app.use('/admin/*', async (c, next) => {
   }
 });
 
-app.use('/super/*', async (c, next) => {
+app.use('/super*', async (c, next) => {
+  if (c.req.path === '/super/login') return await next();
   const token = getCookie(c, 'auth_token');
-  console.log('Super Middleware: token present?', !!token);
-  if (!token) return c.redirect('/login');
+  console.log(`Super Middleware [${c.req.path}]: token present?`, !!token);
+  if (!token) return c.redirect('/super/login');
   try {
     const payload = await verify(token, c.env.JWT_SECRET);
     console.log('Super Middleware: verify success, role:', payload.role);
@@ -332,7 +334,7 @@ app.use('/super/*', async (c, next) => {
     await next();
   } catch (e) {
     console.error('Super Middleware: verify failed', e);
-    return c.redirect('/login');
+    return c.redirect('/super/login');
   }
 });
 
@@ -507,8 +509,60 @@ app.post('/login', async (c) => {
   return c.redirect(user.role === 'superuser' ? '/super' : '/admin');
 });
 
+app.get('/super/login', (c) => {
+  return c.html(pageShell('Superuser Login', `
+<div class="min-h-screen flex items-center justify-center bg-gray-900 px-4">
+  <div class="max-w-md w-full space-y-8 bg-white p-10 rounded-2xl shadow-2xl">
+    <div class="text-center">
+      <h2 class="text-3xl font-extrabold text-gray-900">Superuser Portal</h2>
+      <p class="mt-2 text-sm text-gray-600">Access management controls</p>
+    </div>
+    <form class="mt-8 space-y-6" action="/super/login" method="POST">
+      <div class="rounded-md shadow-sm space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700">Email</label>
+          <input name="email" type="email" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" placeholder="Email" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700">Password</label>
+          <input name="password" type="password" required class="w-full px-3 py-2 border border-gray-300 rounded-lg" placeholder="Password" />
+        </div>
+      </div>
+      <button type="submit" class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700">
+        Access Dashboard
+      </button>
+    </form>
+  </div>
+</div>`));
+});
+
+app.post('/super/login', async (c) => {
+  const form = await c.req.formData();
+  const email = (form.get('email') as string)?.trim().toLowerCase();
+  const password = form.get('password') as string;
+
+  console.log('Super login attempt:', email, 'JWT_SECRET present:', !!c.env.JWT_SECRET);
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first<User>();
+
+  if (!user || user.role !== 'superuser' || !(await verifyPassword(password, user.password_hash))) {
+    console.log('Super login failed for:', email);
+    return c.html(pageShell('Login Failed', '<div class="p-10 text-center text-red-500">Invalid credentials or not a superuser. <a href="/super/login" class="underline">Try again</a></div>'));
+  }
+
+  const token = await sign({ id: user.id, email: user.email, role: user.role }, c.env.JWT_SECRET);
+  setCookie(c, 'auth_token', token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Lax',
+    path: '/',
+    maxAge: 60 * 60 * 24,
+  });
+
+  return c.redirect('/super');
+});
+
 app.get('/logout', (c) => {
-  deleteCookie(c, 'auth_token');
+  deleteCookie(c, 'auth_token', { path: '/' });
   return c.redirect('/login');
 });
 
