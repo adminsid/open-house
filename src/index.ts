@@ -331,7 +331,7 @@ app.use('/admin*', async (c, next) => {
   }
   
   try {
-    const payload = await verify(token, c.env.JWT_SECRET) as any;
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256') as any;
     if (!payload || !payload.id) throw new Error('Invalid payload structure');
     c.set('user', payload);
     await next();
@@ -353,7 +353,7 @@ app.use('/super*', async (c, next) => {
   }
   
   try {
-    const payload = await verify(token, c.env.JWT_SECRET) as any;
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256') as any;
     if (!payload || !payload.id) throw new Error('Invalid payload structure');
     if (payload.role !== 'superuser') {
       console.warn(`Super Middleware [${path}]: User ${payload.email} is not a superuser, forbidden`);
@@ -474,13 +474,14 @@ app.get('/', async (c) => {
 // Auth Routes
 // ---------------------------------------------------------------------------
 
-app.get('/login', (c) => {
-  const body = `
+function loginForm(error?: string): string {
+  return `
 <div class="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
   <div class="max-w-md w-full space-y-8 bg-white p-10 rounded-2xl shadow-xl">
     <div>
       <h2 class="mt-6 text-center text-3xl font-extrabold text-gray-900 font-serif tracking-tight">Sign in to Admin</h2>
     </div>
+    ${error ? `<p class="text-red-600 text-sm text-center font-medium">${escHtml(error)}</p>` : ''}
     <form class="mt-8 space-y-6" action="/login" method="POST">
       <div class="rounded-md shadow-sm space-y-4">
         <div>
@@ -500,7 +501,10 @@ app.get('/login', (c) => {
     </form>
   </div>
 </div>`;
-  return c.html(pageShell('Login', body));
+}
+
+app.get('/login', (c) => {
+  return c.html(pageShell('Login', loginForm()));
 });
 
 app.post('/login', async (c) => {
@@ -704,7 +708,7 @@ app.get('/', async (c) => {
   const token = getCookie(c, 'auth_token');
   if (token) {
     try {
-      const payload = await verify(token, c.env.JWT_SECRET) as any;
+      const payload = await verify(token, c.env.JWT_SECRET, 'HS256') as any;
       if (payload.role === 'superuser') return c.redirect('/super');
       return c.redirect('/admin');
     } catch (e) {
