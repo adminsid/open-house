@@ -1,0 +1,21 @@
+name = "open-house"
+main = "src/index.ts"
+compatibility_date = "2024-10-22"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "open-house-db"
+database_id = "placeholder-replace-with-actual-id"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "placeholder-replace-with-actual-id"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "open-house-photos"
+
+[vars]
+ADMIN_SECRET = "change-this-secret-in-production"
+APP_URL = "https://open-house.workers.dev"
