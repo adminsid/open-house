@@ -325,16 +325,18 @@ app.use('/admin*', async (c, next) => {
   if (path.includes('/login')) return await next();
   
   const token = getCookie(c, 'auth_token');
+  console.log(`Admin Middleware [${path}]: token? ${!!token}`);
   if (!token) return c.redirect('/login');
   
   try {
     const payload = await verify(token, c.env.JWT_SECRET) as any;
     if (!payload || !payload.id) throw new Error('Invalid payload');
+    console.log(`Admin Middleware: user ${payload.email} (${payload.role})`);
     c.set('user', payload);
     await next();
   } catch (e) {
     console.error(`Auth failure on ${path}:`, e);
-    deleteCookie(c, 'auth_token', { path: '/' });
+    // Don't delete cookie yet, maybe it's just a transient error or wrong route
     return c.redirect('/login');
   }
 });
@@ -344,17 +346,21 @@ app.use('/super*', async (c, next) => {
   if (path.includes('/login')) return await next();
   
   const token = getCookie(c, 'auth_token');
+  console.log(`Super Middleware [${path}]: token? ${!!token}`);
   if (!token) return c.redirect('/super/login');
   
   try {
     const payload = await verify(token, c.env.JWT_SECRET) as any;
     if (!payload || !payload.id) throw new Error('Invalid payload');
-    if (payload.role !== 'superuser') return c.text('Forbidden: Superuser access required', 403);
+    if (payload.role !== 'superuser') {
+      console.warn(`Forbidden: ${payload.email} tried to access super route`);
+      return c.text('Forbidden: Superuser access required', 403);
+    }
+    console.log(`Super Middleware: user ${payload.email}`);
     c.set('user', payload);
     await next();
   } catch (e) {
     console.error(`Super Auth failure on ${path}:`, e);
-    deleteCookie(c, 'auth_token', { path: '/' });
     return c.redirect('/super/login');
   }
 });
@@ -678,7 +684,7 @@ app.post('/super/users', async (c) => {
   const email = (form.get('email') as string)?.trim().toLowerCase();
   const password = form.get('password') as string;
   
-  if (!email || !password) return c.text('Missing fields', 400);
+  if (!email || !password) return c.text('Email and password required', 400);
 
   const hash = await hashPassword(password);
   const id = generateId();
@@ -699,6 +705,20 @@ app.post('/super/users/:id/delete', async (c) => {
 
   await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(targetId).run();
   return c.redirect('/super');
+});
+
+app.get('/', async (c) => {
+  const token = getCookie(c, 'auth_token');
+  if (token) {
+    try {
+      const payload = await verify(token, c.env.JWT_SECRET) as any;
+      if (payload.role === 'superuser') return c.redirect('/super');
+      return c.redirect('/admin');
+    } catch (e) {
+      console.error('Auth verification failed at root:', e);
+    }
+  }
+  return c.redirect('/login');
 });
 
 app.get('/super/settings', async (c) => {
@@ -1137,22 +1157,6 @@ app.get('/admin', async (c) => {
         ? `/api/photo/${encodeURIComponent(ev.photo_key)}`
         : null;
       return `
-      <div class="bg-white rounded-xl shadow hover:shadow-md transition-shadow border border-gray-100 overflow-hidden">
-        ${photoUrl ? `<div class="h-36 overflow-hidden"><img src="${escAttr(photoUrl)}" alt="" class="w-full h-full object-cover" \/><\/div>` : ''}
-        <div class="p-5">
-          <div class="flex items-start justify-between mb-2 gap-2">
-            <h3 class="font-semibold text-gray-900 text-base leading-tight">${escHtml(ev.title)}<\/h3>
-            ${statusBadge(liveStatus)}
-          <\/div>
-          <p class="text-sm text-gray-500 mb-0.5">&#128205; ${escHtml(ev.property_address)}<\/p>
-          <p class="text-sm text-gray-500 mb-1">&#128100; ${escHtml(ev.agent_name)}${ev.company_name ? ` &middot; ${escHtml(ev.company_name)}` : ''}<\/p>
-          <p class="text-xs text-gray-400 mb-4">&#128336; ${formatDateTime(ev.start_time, ev.timezone)}<\/p>
-          <div class="flex items-center gap-2 flex-wrap">
-            <a href="/admin/events/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#9998; Manage<\/a>
-            <a href="/agent/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128100; Agent View<\/a>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/duplicate" class="inline">
-              <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Duplicate<\/button>
-            <\/form>
       <a href="/admin/events/${escHtml(ev.admin_token)}" class="block bg-white rounded-xl shadow hover:shadow-md transition-shadow p-5 border border-gray-100">
         <div class="flex items-start justify-between mb-2">
           <h3 class="font-semibold text-gray-900 text-base leading-tight">${escHtml(ev.title)}<\/h3>
@@ -1205,9 +1209,9 @@ ${adminNav(c)}
           Create Event
         <\/button>
       <\/div>
-    <\/form>
-  <\/div>
-<\/div>`;
+    </form>
+  </div>
+</div>`;
   return c.html(pageShell('New Event', body));
 });
 
@@ -1236,7 +1240,6 @@ app.post('/admin/events/new', async (c) => {
         'Error',
         `<div class="flex items-center justify-center min-h-screen">
           <div class="text-center p-8">
-            <h1 class="text-xl font-bold text-red-600 mb-2">Missing required fields<\/h1>
             <h1 class="text-xl font-bold text-red-600 mb-2">Missing required fields</h1>
             <a href="/admin/events/new" class="text-indigo-600 underline">Go back</a>
           </div>
