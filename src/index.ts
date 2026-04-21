@@ -30,6 +30,7 @@ type Event = {
   status: string;
   admin_token: string;
   public_token: string;
+  rsvp_token: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -49,6 +50,9 @@ type Guest = {
   follow_up_status: string;
   follow_up_notes: string | null;
   follow_up_at: string | null;
+  is_rsvp: number;
+  checked_in: number;
+  checked_in_at: string | null;
 };
 
 // ---------------------------------------------------------------------------
@@ -410,7 +414,10 @@ app.get('/e/:token', async (c) => {
       ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-sm font-medium mt-2" style="color:var(--gold)">View Listing &#8599;<\/a>` : ''}
     <\/div>
     ${formHtml}
-    <div class="text-center mt-6 text-slate-600 text-xs">Powered by Open House Sign-in<\/div>
+    <div class="text-center mt-6 text-slate-500 text-xs space-y-2">
+      ${equalHousingLogo('text-slate-400')}
+      <p class="text-slate-600">Powered by Open House Sign-in<\/p>
+    <\/div>
   <\/div>
 <\/div>`;
 
@@ -543,6 +550,9 @@ app.get('/e/:token/success', async (c) => {
            <\/div>
            <p class="text-gray-400 text-xs mt-5">Your agent will be in touch soon &mdash; we look forward to helping you find your perfect home!<\/p>`
         : ''}
+      <div class="mt-6 pt-5 border-t border-gray-100">
+        ${equalHousingLogo('text-gray-400')}
+      <\/div>
     <\/div>
   <\/div>
 <\/div>`;
@@ -720,13 +730,14 @@ app.post('/admin/events/new', async (c) => {
   const id = generateId();
   const admin_token = generateToken(16);
   const public_token = generateToken(16);
+  const rsvp_token = generateToken(16);
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
-    `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)`
+    `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
   )
-    .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, admin_token, public_token, now, now)
+    .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, admin_token, public_token, rsvp_token, now, now)
     .run();
 
   return c.redirect(`/admin/events/${admin_token}`);
@@ -761,6 +772,7 @@ app.get('/admin/events/:adminToken', async (c) => {
   const appUrl = c.env.APP_URL;
   const signInUrl = `${appUrl}/e/${event.public_token}`;
   const agentUrl = `${appUrl}/agent/${event.admin_token}`;
+  const rsvpUrl = event.rsvp_token ? `${appUrl}/rsvp/${event.rsvp_token}` : null;
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(signInUrl)}`;
   const photoUrl = event.photo_key
     ? `/api/photo/${encodeURIComponent(event.photo_key)}`
@@ -773,11 +785,15 @@ app.get('/admin/events/:adminToken', async (c) => {
     .map(
       (g) => `
     <tr class="hover:bg-gray-50">
-      <td class="px-4 py-3 text-sm font-medium text-gray-900 whitespace-nowrap">${escHtml(g.first_name)} ${escHtml(g.last_name)}<\/td>
+      <td class="px-4 py-3 text-sm font-medium text-gray-900 whitespace-nowrap">
+        ${escHtml(g.first_name)} ${escHtml(g.last_name)}
+        ${g.is_rsvp ? '<span class="ml-1 text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-medium">RSVP<\/span>' : ''}
+      <\/td>
       <td class="px-4 py-3 text-sm text-gray-600">${g.email ? `<a href="mailto:${escHtml(g.email)}" class="text-indigo-600 hover:underline">${escHtml(g.email)}<\/a>` : '&mdash;'}<\/td>
       <td class="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">${g.phone ? escHtml(g.phone) : '&mdash;'}<\/td>
       <td class="px-4 py-3 text-sm text-gray-600">${g.address ? escHtml(g.address) : '&mdash;'}<\/td>
       <td class="px-4 py-3 text-sm text-center">${g.is_agent ? '&#9989;' : '&mdash;'}<\/td>
+      <td class="px-4 py-3 text-sm text-center">${g.checked_in ? '<span class="text-green-600 font-semibold">&#10003; In<\/span>' : (g.is_rsvp ? '<span class="text-gray-400">Pending<\/span>' : '&mdash;')}<\/td>
       <td class="px-4 py-3 text-sm text-gray-600">${g.how_did_you_hear ? escHtml(g.how_did_you_hear.replace(/_/g, ' ')) : '&mdash;'}<\/td>
       <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">${formatDateTime(g.signed_in_at, event.timezone)}<\/td>
       <td class="px-4 py-3 text-sm">${followUpBadge(g.follow_up_status)}<\/td>
@@ -884,6 +900,17 @@ ${followUpModal}
         <a href="${escHtml(signInUrl)}" target="_blank" class="text-xs text-indigo-600 hover:underline">Open guest page &#8599;<\/a>
       <\/div>
 
+      ${rsvpUrl ? `<div class="bg-white rounded-xl shadow p-5 border-l-4 border-purple-400">
+        <h2 class="font-semibold text-gray-900 mb-1">RSVP Link<\/h2>
+        <p class="text-xs text-gray-500 mb-3">Share with guests to pre-register before the event.<\/p>
+        <div class="flex items-center gap-2 mb-2">
+          <input id="rsvp-url" type="text" readonly value="${escHtml(rsvpUrl)}"
+            class="flex-1 text-xs bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-gray-600" \/>
+          <button onclick="copyText('rsvp-url')" class="bg-purple-600 text-white text-xs px-3 py-2 rounded-lg hover:bg-purple-700 transition-colors whitespace-nowrap">Copy<\/button>
+        <\/div>
+        <a href="${escHtml(rsvpUrl)}" target="_blank" class="text-xs text-purple-600 hover:underline">Preview RSVP page &#8599;<\/a>
+      <\/div>` : ''}
+
       <div class="bg-white rounded-xl shadow p-5">
         <h2 class="font-semibold text-gray-900 mb-3">Agent Management Link<\/h2>
         <div class="flex items-center gap-2 mb-2">
@@ -932,12 +959,56 @@ ${followUpModal}
           <\/div>
         <\/form>
       <\/div>
+
+      <div class="bg-white rounded-xl shadow p-6">
+        <h2 class="font-semibold text-gray-900 mb-4">Manually Add Guest \/ RSVP<\/h2>
+        <form method="POST" action="/admin/events/${escHtml(adminToken)}/guests/add" class="space-y-3">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-medium text-gray-600 mb-1">First Name <span class="text-red-500">*<\/span><\/label>
+              <input type="text" name="first_name" required class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+            <\/div>
+            <div>
+              <label class="block text-xs font-medium text-gray-600 mb-1">Last Name <span class="text-red-500">*<\/span><\/label>
+              <input type="text" name="last_name" required class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+            <\/div>
+          <\/div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-medium text-gray-600 mb-1">Email<\/label>
+              <input type="email" name="email" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+            <\/div>
+            <div>
+              <label class="block text-xs font-medium text-gray-600 mb-1">Phone<\/label>
+              <input type="tel" name="phone" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+            <\/div>
+          <\/div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">Type<\/label>
+            <select name="is_rsvp" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+              <option value="1">RSVP (pre-registered)<\/option>
+              <option value="0">Walk-in<\/option>
+            <\/select>
+          <\/div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">Notes<\/label>
+            <input type="text" name="notes" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Optional notes&hellip;" \/>
+          <\/div>
+          <div class="flex justify-end">
+            <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-5 py-2 rounded-lg transition-colors">Add Guest<\/button>
+          <\/div>
+        <\/form>
+      <\/div>
     <\/div>
   <\/div>
 
   <div class="bg-white rounded-xl shadow">
     <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
       <h2 class="font-semibold text-gray-900">Guests <span class="text-gray-400 font-normal">(${(guests.results ?? []).length})<\/span><\/h2>
+      <a href="/admin/events/${escHtml(adminToken)}/export.csv"
+        class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
+        &#11015; Export CSV
+      <\/a>
     <\/div>
     <div class="overflow-x-auto">
       <table class="min-w-full divide-y divide-gray-100">
@@ -948,6 +1019,7 @@ ${followUpModal}
             <th class="px-4 py-3 text-left">Phone<\/th>
             <th class="px-4 py-3 text-left">Address<\/th>
             <th class="px-4 py-3 text-center">Agent?<\/th>
+            <th class="px-4 py-3 text-center">Check-in<\/th>
             <th class="px-4 py-3 text-left">How Heard<\/th>
             <th class="px-4 py-3 text-left">Signed In<\/th>
             <th class="px-4 py-3 text-left">Follow-up<\/th>
@@ -956,7 +1028,7 @@ ${followUpModal}
           <\/tr>
         <\/thead>
         <tbody class="divide-y divide-gray-50">
-          ${guestRows || `<tr><td colspan="10" class="px-4 py-10 text-center text-gray-400 text-sm">No guests have signed in yet.<\/td><\/tr>`}
+          ${guestRows || `<tr><td colspan="11" class="px-4 py-10 text-center text-gray-400 text-sm">No guests have signed in yet.<\/td><\/tr>`}
         <\/tbody>
       <\/table>
     <\/div>
@@ -1195,13 +1267,14 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
   const newId = generateId();
   const newAdminToken = generateToken(16);
   const newPublicToken = generateToken(16);
+  const newRsvpToken = generateToken(16);
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
     `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name,
        description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key,
-       status, admin_token, public_token, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)`
+       status, admin_token, public_token, rsvp_token, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
   )
     .bind(
       newId,
@@ -1222,6 +1295,7 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
       null,
       newAdminToken,
       newPublicToken,
+      newRsvpToken,
       now,
       now
     )
@@ -1278,6 +1352,7 @@ app.get('/agent/:adminToken', async (c) => {
   const liveStatus = getEventStatus(event, new Date());
   const appUrl = c.env.APP_URL;
   const signInUrl = `${appUrl}/e/${event.public_token}`;
+  const rsvpUrl = event.rsvp_token ? `${appUrl}/rsvp/${event.rsvp_token}` : null;
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(signInUrl)}`;
   const photoUrl = event.photo_key
     ? `/api/photo/${encodeURIComponent(event.photo_key)}`
@@ -1293,8 +1368,9 @@ app.get('/agent/:adminToken', async (c) => {
     .toUpperCase() || '??';
 
   const guestCount = (guests.results ?? []).length;
+  const rsvpCount = (guests.results ?? []).filter((g) => g.is_rsvp).length;
+  const checkedInCount = (guests.results ?? []).filter((g) => g.checked_in).length;
   const pendingCount = (guests.results ?? []).filter((g) => g.follow_up_status === 'pending').length;
-  const interestedCount = (guests.results ?? []).filter((g) => g.follow_up_status === 'interested').length;
 
   const guestRows = (guests.results ?? [])
     .map(
@@ -1302,6 +1378,7 @@ app.get('/agent/:adminToken', async (c) => {
     <tr class="hover:bg-gray-50">
       <td class="px-4 py-3">
         <div class="text-sm font-medium text-gray-900">${escHtml(g.first_name)} ${escHtml(g.last_name)}<\/div>
+        ${g.is_rsvp ? '<span class="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-medium">RSVP<\/span>' : ''}
         ${g.is_agent ? '<div class="text-xs text-amber-600 font-medium">With Agent<\/div>' : ''}
       <\/td>
       <td class="px-4 py-3 text-sm text-gray-600">
@@ -1309,6 +1386,15 @@ app.get('/agent/:adminToken', async (c) => {
       <\/td>
       <td class="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">
         ${g.phone ? `<a href="tel:${escHtml(g.phone)}" class="hover:text-indigo-600">${escHtml(g.phone)}<\/a>` : '&mdash;'}
+      <\/td>
+      <td class="px-4 py-3 text-sm text-center">
+        ${g.checked_in
+          ? `<span class="text-green-600 font-semibold text-xs">&#10003; Checked In<\/span>`
+          : g.is_rsvp
+            ? `<form method="POST" action="/agent/${escHtml(adminToken)}/guests/${escAttr(g.id)}/checkin" class="inline">
+                <button type="submit" class="bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-2 py-1 rounded-lg border border-green-200 transition-colors">Check In<\/button>
+               <\/form>`
+            : '&mdash;'}
       <\/td>
       <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">${formatDateTime(g.signed_in_at, event.timezone)}<\/td>
       <td class="px-4 py-3 text-sm">${followUpBadge(g.follow_up_status)}<\/td>
@@ -1351,6 +1437,50 @@ app.get('/agent/:adminToken', async (c) => {
     <\/form>
   <\/div>
 <\/div>
+
+<div id="add-guest-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+  <div class="bg-white rounded-2xl shadow-xl p-6 w-full max-w-lg mx-4">
+    <h3 class="text-lg font-semibold text-gray-900 mb-4">Add Guest<\/h3>
+    <form method="POST" action="/agent/${escHtml(adminToken)}/guests/add" class="space-y-3">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">First Name <span class="text-red-500">*<\/span><\/label>
+          <input type="text" name="first_name" required class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+        <\/div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Last Name <span class="text-red-500">*<\/span><\/label>
+          <input type="text" name="last_name" required class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+        <\/div>
+      <\/div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Email<\/label>
+          <input type="email" name="email" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+        <\/div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Phone<\/label>
+          <input type="tel" name="phone" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+        <\/div>
+      <\/div>
+      <div>
+        <label class="block text-xs font-medium text-gray-600 mb-1">Type<\/label>
+        <select name="is_rsvp" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+          <option value="1">RSVP (pre-registered)<\/option>
+          <option value="0">Walk-in<\/option>
+        <\/select>
+      <\/div>
+      <div>
+        <label class="block text-xs font-medium text-gray-600 mb-1">Notes<\/label>
+        <input type="text" name="notes" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Optional notes&hellip;" \/>
+      <\/div>
+      <div class="flex justify-end gap-3 pt-1">
+        <button type="button" onclick="closeAddGuest()" class="text-gray-600 px-4 py-2 rounded-lg border hover:bg-gray-50 text-sm">Cancel<\/button>
+        <button type="submit" class="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-indigo-700">Add Guest<\/button>
+      <\/div>
+    <\/form>
+  <\/div>
+<\/div>
+
 <script>
 function openFollowUp(guestId, status, notes) {
   document.getElementById('followup-form').action = '/agent/${escHtml(adminToken)}/guests/' + guestId + '/followup';
@@ -1360,6 +1490,12 @@ function openFollowUp(guestId, status, notes) {
 }
 function closeFollowUp() {
   document.getElementById('followup-modal').classList.add('hidden');
+}
+function openAddGuest() {
+  document.getElementById('add-guest-modal').classList.remove('hidden');
+}
+function closeAddGuest() {
+  document.getElementById('add-guest-modal').classList.add('hidden');
 }
 <\/script>`;
 
@@ -1389,22 +1525,26 @@ ${followUpModal}
     <\/div>
   <\/div>
 
-  <div class="grid grid-cols-3 gap-4">
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
     <div class="bg-white rounded-xl shadow p-5 text-center">
       <p class="text-3xl font-bold text-gray-900">${guestCount}<\/p>
       <p class="text-sm text-gray-500 mt-1">Total Guests<\/p>
     <\/div>
     <div class="bg-white rounded-xl shadow p-5 text-center">
+      <p class="text-3xl font-bold text-purple-600">${rsvpCount}<\/p>
+      <p class="text-sm text-gray-500 mt-1">RSVPs<\/p>
+    <\/div>
+    <div class="bg-white rounded-xl shadow p-5 text-center">
+      <p class="text-3xl font-bold text-green-600">${checkedInCount}<\/p>
+      <p class="text-sm text-gray-500 mt-1">Checked In<\/p>
+    <\/div>
+    <div class="bg-white rounded-xl shadow p-5 text-center">
       <p class="text-3xl font-bold text-yellow-600">${pendingCount}<\/p>
       <p class="text-sm text-gray-500 mt-1">Need Follow-up<\/p>
     <\/div>
-    <div class="bg-white rounded-xl shadow p-5 text-center">
-      <p class="text-3xl font-bold text-green-600">${interestedCount}<\/p>
-      <p class="text-sm text-gray-500 mt-1">Interested<\/p>
-    <\/div>
   <\/div>
 
-  <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
     <div class="bg-white rounded-xl shadow p-5">
       <h2 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Guest Sign-in Link<\/h2>
       <div class="flex items-center gap-2 mb-2">
@@ -1414,6 +1554,16 @@ ${followUpModal}
       <\/div>
       <a href="${escHtml(signInUrl)}" target="_blank" class="text-xs text-indigo-600 hover:underline">Preview guest page &#8599;<\/a>
     <\/div>
+    ${rsvpUrl ? `<div class="bg-white rounded-xl shadow p-5 border-l-4 border-purple-400">
+      <h2 class="text-xs font-semibold text-purple-600 uppercase tracking-wide mb-1">RSVP Link<\/h2>
+      <p class="text-xs text-gray-400 mb-2">Share to let guests pre-register<\/p>
+      <div class="flex items-center gap-2 mb-2">
+        <input id="rsvp-url" type="text" readonly value="${escHtml(rsvpUrl)}"
+          class="flex-1 text-xs bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-gray-600" \/>
+        <button onclick="copyText('rsvp-url')" class="bg-purple-600 text-white text-xs px-3 py-2 rounded-lg hover:bg-purple-700 whitespace-nowrap">Copy<\/button>
+      <\/div>
+      <a href="${escHtml(rsvpUrl)}" target="_blank" class="text-xs text-purple-600 hover:underline">Preview RSVP page &#8599;<\/a>
+    <\/div>` : '<div class="bg-white rounded-xl shadow p-5"><p class="text-xs text-gray-400">No RSVP link available.<\/p><\/div>'}
     <div class="bg-white rounded-xl shadow p-5 text-center">
       <h2 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">QR Code<\/h2>
       <img src="${escHtml(qrUrl)}" alt="QR" class="mx-auto rounded border border-gray-100 w-28 h-28" \/>
@@ -1422,8 +1572,15 @@ ${followUpModal}
   <\/div>
 
   <div class="bg-white rounded-xl shadow">
-    <div class="px-6 py-4 border-b border-gray-100">
+    <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between flex-wrap gap-2">
       <h2 class="font-semibold text-gray-900">Guests <span class="text-gray-400 font-normal">(${guestCount})<\/span><\/h2>
+      <div class="flex gap-2">
+        <button onclick="openAddGuest()" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">+ Add Guest<\/button>
+        <a href="/agent/${escHtml(adminToken)}/export.csv"
+          class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
+          &#11015; Export CSV
+        <\/a>
+      <\/div>
     <\/div>
     <div class="overflow-x-auto">
       <table class="min-w-full divide-y divide-gray-100">
@@ -1432,6 +1589,7 @@ ${followUpModal}
             <th class="px-4 py-3 text-left">Name<\/th>
             <th class="px-4 py-3 text-left">Email<\/th>
             <th class="px-4 py-3 text-left">Phone<\/th>
+            <th class="px-4 py-3 text-center">Check-in<\/th>
             <th class="px-4 py-3 text-left">Signed In<\/th>
             <th class="px-4 py-3 text-left">Follow-up<\/th>
             <th class="px-4 py-3 text-left">Notes<\/th>
@@ -1439,7 +1597,7 @@ ${followUpModal}
           <\/tr>
         <\/thead>
         <tbody class="divide-y divide-gray-50">
-          ${guestRows || `<tr><td colspan="7" class="px-4 py-10 text-center text-gray-400 text-sm">No guests have signed in yet.<\/td><\/tr>`}
+          ${guestRows || `<tr><td colspan="8" class="px-4 py-10 text-center text-gray-400 text-sm">No guests have signed in yet.<\/td><\/tr>`}
         <\/tbody>
       <\/table>
     <\/div>
@@ -1482,6 +1640,469 @@ app.post('/agent/:adminToken/guests/:guestId/followup', async (c) => {
 
   return c.redirect(`/agent/${adminToken}`);
 });
+
+// ---------------------------------------------------------------------------
+// Agent: check in a guest
+// ---------------------------------------------------------------------------
+
+app.post('/agent/:adminToken/guests/:guestId/checkin', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const guestId = c.req.param('guestId');
+
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id'>>();
+
+  if (!event) return c.notFound();
+
+  await c.env.DB.prepare(
+    'UPDATE guests SET checked_in = 1, checked_in_at = ? WHERE id = ? AND event_id = ?'
+  )
+    .bind(new Date().toISOString(), guestId, event.id)
+    .run();
+
+  return c.redirect(`/agent/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Agent: manually add a guest
+// ---------------------------------------------------------------------------
+
+app.post('/agent/:adminToken/guests/add', async (c) => {
+  const adminToken = c.req.param('adminToken');
+
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id'>>();
+
+  if (!event) return c.notFound();
+
+  const form = await c.req.formData();
+  const firstName = (form.get('first_name') as string | null)?.trim() ?? '';
+  const lastName = (form.get('last_name') as string | null)?.trim() ?? '';
+
+  if (!firstName || !lastName) return c.redirect(`/agent/${adminToken}`);
+
+  const email = (form.get('email') as string | null)?.trim() || null;
+  const phone = (form.get('phone') as string | null)?.trim() || null;
+  const notes = (form.get('notes') as string | null)?.trim() || null;
+  const isRsvp = form.get('is_rsvp') === '1' ? 1 : 0;
+  const now = new Date().toISOString();
+
+  await c.env.DB.prepare(
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes, signed_in_at, follow_up_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+  )
+    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, notes, now)
+    .run();
+
+  return c.redirect(`/agent/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Agent: export guests as CSV
+// ---------------------------------------------------------------------------
+
+app.get('/agent/:adminToken/export.csv', async (c) => {
+  const adminToken = c.req.param('adminToken');
+
+  const event = await c.env.DB.prepare(
+    'SELECT id, title, timezone FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'title' | 'timezone'>>();
+
+  if (!event) return c.notFound();
+
+  const guests = await c.env.DB.prepare(
+    'SELECT * FROM guests WHERE event_id = ? ORDER BY signed_in_at ASC'
+  )
+    .bind(event.id)
+    .all<Guest>();
+
+  const csv = buildGuestsCsv(guests.results ?? [], event.timezone);
+  const filename = `guests-${event.title.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.csv`;
+
+  return new Response(csv, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Admin: manually add a guest
+// ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/guests/add', async (c) => {
+  const adminToken = c.req.param('adminToken');
+
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id'>>();
+
+  if (!event) return c.notFound();
+
+  const form = await c.req.formData();
+  const firstName = (form.get('first_name') as string | null)?.trim() ?? '';
+  const lastName = (form.get('last_name') as string | null)?.trim() ?? '';
+
+  if (!firstName || !lastName) return c.redirect(`/admin/events/${adminToken}`);
+
+  const email = (form.get('email') as string | null)?.trim() || null;
+  const phone = (form.get('phone') as string | null)?.trim() || null;
+  const notes = (form.get('notes') as string | null)?.trim() || null;
+  const isRsvp = form.get('is_rsvp') === '1' ? 1 : 0;
+  const now = new Date().toISOString();
+
+  await c.env.DB.prepare(
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes, signed_in_at, follow_up_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+  )
+    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, notes, now)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: export guests as CSV
+// ---------------------------------------------------------------------------
+
+app.get('/admin/events/:adminToken/export.csv', async (c) => {
+  const adminToken = c.req.param('adminToken');
+
+  const event = await c.env.DB.prepare(
+    'SELECT id, title, timezone FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'title' | 'timezone'>>();
+
+  if (!event) return c.notFound();
+
+  const guests = await c.env.DB.prepare(
+    'SELECT * FROM guests WHERE event_id = ? ORDER BY signed_in_at ASC'
+  )
+    .bind(event.id)
+    .all<Guest>();
+
+  const csv = buildGuestsCsv(guests.results ?? [], event.timezone);
+  const filename = `guests-${event.title.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.csv`;
+
+  return new Response(csv, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RSVP page (guest pre-registration)
+// ---------------------------------------------------------------------------
+
+app.get('/rsvp/:rsvpToken', async (c) => {
+  const rsvpToken = c.req.param('rsvpToken');
+  const event = await c.env.DB.prepare(
+    'SELECT * FROM events WHERE rsvp_token = ?'
+  )
+    .bind(rsvpToken)
+    .first<Event>();
+
+  if (!event) {
+    return c.html(
+      guestPageShell(
+        'Event Not Found',
+        `<div class="flex items-center justify-center min-h-screen p-8">
+          <div class="text-center">
+            <div class="text-6xl mb-5">&#127968;<\/div>
+            <h1 class="text-2xl font-bold text-white mb-2">Event Not Found<\/h1>
+            <p class="text-slate-400 text-sm">This RSVP link is invalid or has expired.<\/p>
+          <\/div>
+        <\/div>`
+      ),
+      404
+    );
+  }
+
+  const liveStatus = getEventStatus(event, new Date());
+  const isCancelled = liveStatus === 'cancelled';
+  const isEnded = liveStatus === 'ended';
+
+  const photoUrl = event.photo_key
+    ? `/api/photo/${encodeURIComponent(event.photo_key)}`
+    : null;
+  const agentPhotoUrl = event.agent_photo_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
+    : null;
+  const initials = event.agent_name
+    .split(' ')
+    .map((p) => p[0] ?? '')
+    .join('')
+    .slice(0, 2)
+    .toUpperCase() || '??';
+
+  const heroHtml = `
+<div class="relative h-72 sm:h-96 w-full overflow-hidden">
+  ${photoUrl
+    ? `<img src="${escAttr(photoUrl)}" alt="${escAttr(event.title)}" class="w-full h-full object-cover" \/>`
+    : `<div class="w-full h-full" style="background:linear-gradient(135deg,#1a3557 0%,#0f1c2e 100%)"><\/div>`}
+  <div class="hero-overlay absolute inset-0"><\/div>
+  <div class="absolute bottom-0 left-0 right-0 px-5 pb-5">
+    <div class="max-w-lg mx-auto flex items-end gap-4">
+      <div class="flex-shrink-0">
+        ${agentPhotoUrl
+          ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover shadow-xl" style="border-color:var(--gold)" \/>`
+          : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold shadow-xl" style="border-color:var(--gold);background:rgba(201,168,76,0.25);color:var(--gold)">${escHtml(initials)}<\/div>`}
+      <\/div>
+      <div class="min-w-0 flex-1">
+        ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest mb-0.5" style="color:var(--gold)">${escHtml(event.company_name)}<\/p>` : ''}
+        <p class="text-white font-semibold text-sm leading-tight">${escHtml(event.agent_name)}<\/p>
+        <p class="text-slate-300 text-xs mt-0.5">${escHtml(event.agent_email)}${event.agent_phone ? ` &middot; ${escHtml(event.agent_phone)}` : ''}<\/p>
+      <\/div>
+      <div class="flex-shrink-0">${statusBadge(liveStatus)}<\/div>
+    <\/div>
+  <\/div>
+<\/div>`;
+
+  const formHtml = isCancelled
+    ? `<div class="glass-card rounded-2xl shadow-xl p-8 text-center anim-2">
+        <div class="text-5xl mb-4">&#10060;<\/div>
+        <h2 class="text-lg font-bold text-gray-900 mb-2">Event Cancelled<\/h2>
+        <p class="text-gray-500 text-sm">This open house has been cancelled. Please contact the agent for more information.<\/p>
+        <div class="mt-5 pt-5 border-t border-gray-100 text-sm text-gray-500">
+          <a href="mailto:${escAttr(event.agent_email)}" class="font-medium" style="color:var(--gold)">${escHtml(event.agent_name)}<\/a>
+          ${event.agent_phone ? ` &nbsp;&middot;&nbsp; ${escHtml(event.agent_phone)}` : ''}
+        <\/div>
+      <\/div>`
+    : isEnded
+    ? `<div class="glass-card rounded-2xl shadow-xl p-8 text-center anim-2">
+        <div class="text-5xl mb-4">&#9203;<\/div>
+        <h2 class="text-lg font-bold text-gray-900 mb-2">Event Has Ended<\/h2>
+        <p class="text-gray-500 text-sm">RSVPs are no longer being accepted for this event.<\/p>
+      <\/div>`
+    : `<div class="glass-card rounded-2xl shadow-xl p-6 anim-2">
+        <div class="text-center mb-5">
+          <h2 class="text-xl font-bold text-gray-900">RSVP to This Open House<\/h2>
+          <p class="text-gray-500 text-sm mt-1">Reserve your spot &mdash; we&rsquo;d love to see you there<\/p>
+          <div class="divider mt-4"><\/div>
+        <\/div>
+        <form method="POST" action="/rsvp/${escHtml(rsvpToken)}/submit" class="space-y-4">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">First Name <span class="text-red-400">*<\/span><\/label>
+              <input type="text" name="first_name" required autofocus
+                class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
+                placeholder="Jane" \/>
+            <\/div>
+            <div>
+              <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Last Name <span class="text-red-400">*<\/span><\/label>
+              <input type="text" name="last_name" required
+                class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
+                placeholder="Smith" \/>
+            <\/div>
+          <\/div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Email Address <span class="text-red-400">*<\/span><\/label>
+            <input type="email" name="email" required
+              class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
+              placeholder="jane@example.com" \/>
+          <\/div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Phone Number<\/label>
+            <input type="tel" name="phone"
+              class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
+              placeholder="(555) 000-0000" \/>
+          <\/div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Notes \/ Questions<\/label>
+            <textarea name="notes" rows="2"
+              class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
+              placeholder="Anything you&rsquo;d like the agent to know&hellip;"><\/textarea>
+          <\/div>
+          <div class="pt-1">
+            <button type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
+              &#127968; &nbsp;RSVP Now
+            <\/button>
+          <\/div>
+        <\/form>
+      <\/div>`;
+
+  const body = `
+<div style="background-color:var(--navy);min-height:100vh">
+  ${heroHtml}
+  <div class="max-w-lg mx-auto px-4 pb-12 -mt-3 relative">
+    <div class="glass-card rounded-2xl shadow-2xl p-5 mb-4 anim-1">
+      <h1 class="text-lg font-bold text-gray-900 leading-tight mb-1">${escHtml(event.title)}<\/h1>
+      <p class="text-gray-500 text-sm mb-0.5">&#128205; ${escHtml(event.property_address)}<\/p>
+      <p class="text-gray-500 text-sm">&#128336; ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}<\/p>
+      ${event.description ? `<div class="divider my-3"><\/div><p class="text-gray-500 text-sm italic">${escHtml(event.description)}<\/p>` : ''}
+      ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-sm font-medium mt-2" style="color:var(--gold)">View Listing &#8599;<\/a>` : ''}
+    <\/div>
+    ${formHtml}
+    <div class="text-center mt-6 text-slate-500 text-xs space-y-2">
+      ${equalHousingLogo('text-slate-400')}
+      <p class="text-slate-600">Powered by Open House Sign-in<\/p>
+    <\/div>
+  <\/div>
+<\/div>`;
+
+  return c.html(guestPageShell(`RSVP \u2013 ${event.title}`, body));
+});
+
+// ---------------------------------------------------------------------------
+// RSVP submit
+// ---------------------------------------------------------------------------
+
+app.post('/rsvp/:rsvpToken/submit', async (c) => {
+  const rsvpToken = c.req.param('rsvpToken');
+  const event = await c.env.DB.prepare(
+    'SELECT * FROM events WHERE rsvp_token = ?'
+  )
+    .bind(rsvpToken)
+    .first<Event>();
+
+  if (!event) return c.notFound();
+
+  const liveStatus = getEventStatus(event, new Date());
+  if (liveStatus === 'cancelled' || liveStatus === 'ended') {
+    return c.redirect(`/rsvp/${rsvpToken}`);
+  }
+
+  const form = await c.req.formData();
+  const firstName = (form.get('first_name') as string | null)?.trim() ?? '';
+  const lastName = (form.get('last_name') as string | null)?.trim() ?? '';
+  const email = (form.get('email') as string | null)?.trim() ?? '';
+
+  if (!firstName || !lastName || !email) {
+    return c.redirect(`/rsvp/${rsvpToken}`);
+  }
+
+  const phone = (form.get('phone') as string | null)?.trim() || null;
+  const notes = (form.get('notes') as string | null)?.trim() || null;
+  const now = new Date().toISOString();
+
+  await c.env.DB.prepare(
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes, signed_in_at, follow_up_status)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending')`
+  )
+    .bind(generateId(), event.id, firstName, lastName, email, phone, notes, now)
+    .run();
+
+  return c.redirect(`/rsvp/${rsvpToken}/success`);
+});
+
+// ---------------------------------------------------------------------------
+// RSVP success page
+// ---------------------------------------------------------------------------
+
+app.get('/rsvp/:rsvpToken/success', async (c) => {
+  const rsvpToken = c.req.param('rsvpToken');
+  const event = await c.env.DB.prepare(
+    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, photo_key, start_time, end_time, timezone FROM events WHERE rsvp_token = ?'
+  )
+    .bind(rsvpToken)
+    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'photo_key' | 'start_time' | 'end_time' | 'timezone'>>();
+
+  const title = event?.title ?? 'Open House';
+  const photoUrl = event?.photo_key
+    ? `/api/photo/${encodeURIComponent(event.photo_key)}`
+    : null;
+  const agentPhotoUrl = event?.agent_photo_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
+    : null;
+  const initials = (event?.agent_name ?? '??')
+    .split(' ')
+    .map((p) => p[0] ?? '')
+    .join('')
+    .slice(0, 2)
+    .toUpperCase() || '??';
+
+  const body = `
+<div style="background-color:var(--navy);min-height:100vh">
+  ${photoUrl
+    ? `<div class="relative h-40 overflow-hidden">
+         <img src="${escAttr(photoUrl)}" alt="${escAttr(title)}" class="w-full h-full object-cover opacity-50" \/>
+         <div class="hero-overlay absolute inset-0"><\/div>
+       <\/div>`
+    : `<div class="h-20" style="background:linear-gradient(135deg,#1a3557 0%,#0f1c2e 100%)"><\/div>`}
+  <div class="max-w-lg mx-auto px-4 pb-12 -mt-6 relative">
+    <div class="glass-card rounded-2xl shadow-2xl p-8 text-center anim-1">
+      <div class="text-6xl mb-4">&#9989;<\/div>
+      <h1 class="text-2xl font-bold text-gray-900 mb-2">You&rsquo;re On The List!</h1>
+      <p class="text-gray-600 mb-3">You&rsquo;ve successfully RSVP&rsquo;d for <strong>${escHtml(title)}<\/strong>.<\/p>
+      ${event ? `<p class="text-gray-500 text-sm mb-6">&#128336; ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}<\/p>` : ''}
+      <div class="divider mb-6"><\/div>
+      ${event
+        ? `<div class="flex items-center justify-center gap-4">
+             <div class="flex-shrink-0">
+               ${agentPhotoUrl
+                 ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover" style="border-color:var(--gold)" \/>`
+                 : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold" style="border-color:var(--gold);background:rgba(201,168,76,0.1);color:var(--gold)">${escHtml(initials)}<\/div>`}
+             <\/div>
+             <div class="text-left">
+               ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest" style="color:var(--gold)">${escHtml(event.company_name)}<\/p>` : ''}
+               <p class="font-semibold text-gray-900 text-sm">${escHtml(event.agent_name)}<\/p>
+               <a href="mailto:${escAttr(event.agent_email)}" class="text-xs text-gray-500 hover:underline">${escHtml(event.agent_email)}<\/a>
+               ${event.agent_phone ? `<p class="text-xs text-gray-500">${escHtml(event.agent_phone)}<\/p>` : ''}
+             <\/div>
+           <\/div>
+           <p class="text-gray-400 text-xs mt-5">We look forward to seeing you there! The agent will be in touch with any updates.<\/p>`
+        : ''}
+      <div class="mt-6 pt-5 border-t border-gray-100">
+        ${equalHousingLogo('text-gray-400')}
+      <\/div>
+    <\/div>
+  <\/div>
+<\/div>`;
+
+  return c.html(guestPageShell(`RSVP Confirmed \u2013 ${title}`, body));
+});
+
+// ---------------------------------------------------------------------------
+// CSV builder helper
+// ---------------------------------------------------------------------------
+
+function csvField(val: string | null | undefined): string {
+  const s = val ?? '';
+  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function buildGuestsCsv(guests: Guest[], timezone: string): string {
+  const headers = [
+    'First Name', 'Last Name', 'Email', 'Phone', 'Address',
+    'Type', 'Checked In', 'Checked In At', 'With Agent',
+    'How Did You Hear', 'Notes', 'Signed In At',
+    'Follow-up Status', 'Follow-up Notes',
+  ];
+  const rows = guests.map((g) => [
+    csvField(g.first_name),
+    csvField(g.last_name),
+    csvField(g.email),
+    csvField(g.phone),
+    csvField(g.address),
+    g.is_rsvp ? 'RSVP' : 'Walk-in',
+    g.checked_in ? 'Yes' : 'No',
+    csvField(g.checked_in_at ? formatDateTime(g.checked_in_at, timezone) : null),
+    g.is_agent ? 'Yes' : 'No',
+    csvField(g.how_did_you_hear?.replace(/_/g, ' ') ?? null),
+    csvField(g.notes),
+    csvField(formatDateTime(g.signed_in_at, timezone)),
+    csvField(g.follow_up_status),
+    csvField(g.follow_up_notes),
+  ].join(','));
+  return [headers.join(','), ...rows].join('\r\n');
+}
 
 // ---------------------------------------------------------------------------
 // Shared: event form fields helper
@@ -1596,6 +2217,17 @@ function escHtml(str: string): string {
 
 function escAttr(str: string): string {
   return escHtml(str);
+}
+
+function equalHousingLogo(classes = ''): string {
+  return `<div class="flex items-center justify-center gap-2 ${classes}" title="Equal Housing Opportunity">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 110" class="w-8 h-8 flex-shrink-0" aria-label="Equal Housing Opportunity logo" role="img">
+      <polygon points="50,5 95,45 85,45 85,98 15,98 15,45 5,45" fill="none" stroke="currentColor" stroke-width="6" stroke-linejoin="round"/>
+      <line x1="33" y1="66" x2="67" y2="66" stroke="currentColor" stroke-width="7" stroke-linecap="round"/>
+      <line x1="33" y1="80" x2="67" y2="80" stroke="currentColor" stroke-width="7" stroke-linecap="round"/>
+    <\/svg>
+    <span class="text-xs font-semibold uppercase tracking-wide">Equal Housing Opportunity<\/span>
+  <\/div>`;
 }
 
 export default app;
