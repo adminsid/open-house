@@ -134,7 +134,7 @@ function pageShell(title: string, body: string, extraHead = ''): string {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>${title} | Open House</title>
+  <title>${escHtml(title)} | Open House</title>
   <script src="https://cdn.tailwindcss.com"></script>
   ${extraHead}
   <style>
@@ -217,7 +217,7 @@ app.get('/e/:token', async (c) => {
 <div class="min-h-screen bg-gradient-to-br from-indigo-50 to-white">
   <div class="max-w-lg mx-auto px-4 py-10">
     ${photoUrl ? `<div class="mb-6 rounded-2xl overflow-hidden shadow-lg">
-      <img src="${photoUrl}" alt="Property photo" class="w-full h-56 object-cover" />
+      <img src="${escAttr(photoUrl)}" alt="Property photo" class="w-full h-56 object-cover" />
     </div>` : ''}
 
     <div class="bg-white rounded-2xl shadow-lg p-6 mb-6">
@@ -491,7 +491,7 @@ app.post('/admin/events/new', async (c) => {
 
   const id = generateId();
   const admin_token = generateToken(16); // 16 bytes → 32-char hex
-  const public_token = generateToken(8);  // 8 bytes → 16-char hex
+  const public_token = generateToken(16); // 16 bytes → 32-char hex
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
@@ -548,7 +548,11 @@ app.get('/admin/events/:adminToken', async (c) => {
       <td class="px-4 py-3 text-sm">${followUpBadge(g.follow_up_status)}</td>
       <td class="px-4 py-3 text-sm text-gray-600">${g.follow_up_notes ? escHtml(g.follow_up_notes) : '—'}</td>
       <td class="px-4 py-3 text-sm">
-        <button onclick="openFollowUp('${escHtml(g.id)}','${escHtml(g.follow_up_status)}','${escAttr(g.follow_up_notes ?? '')}')"
+        <button
+          data-guest-id="${escAttr(g.id)}"
+          data-follow-up-status="${escAttr(g.follow_up_status)}"
+          data-follow-up-notes="${escAttr(g.follow_up_notes ?? '')}"
+          onclick="openFollowUp(this.dataset.guestId,this.dataset.followUpStatus,this.dataset.followUpNotes)"
           class="text-indigo-600 hover:text-indigo-800 text-xs font-medium">Edit</button>
       </td>
     </tr>`)
@@ -645,7 +649,7 @@ ${followUpModal}
       <!-- Photo -->
       <div class="bg-white rounded-xl shadow p-5">
         <h2 class="font-semibold text-gray-900 mb-3">Property Photo</h2>
-        ${photoUrl ? `<div class="mb-3 rounded-lg overflow-hidden"><img src="${photoUrl}" alt="Property" class="w-full h-40 object-cover" /></div>` : '<p class="text-sm text-gray-400 mb-3">No photo uploaded yet.</p>'}
+        ${photoUrl ? `<div class="mb-3 rounded-lg overflow-hidden"><img src="${escAttr(photoUrl)}" alt="Property" class="w-full h-40 object-cover" /></div>` : '<p class="text-sm text-gray-400 mb-3">No photo uploaded yet.</p>'}
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/photo" enctype="multipart/form-data" class="space-y-2">
           <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
           <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">Upload Photo</button>
@@ -762,10 +766,9 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  // Delete old photo if exists; ignore NotFound errors, re-throw others
+  // Delete old photo if one exists (R2 delete is a no-op for missing keys)
   if (event.photo_key) {
     await c.env.BUCKET.delete(event.photo_key).catch((err: unknown) => {
-      if (err instanceof Error && err.message.includes('NoSuchKey')) return;
       console.error('R2 delete error:', err);
     });
   }

@@ -18,8 +18,11 @@ CREATE TABLE IF NOT EXISTS events (
   status TEXT NOT NULL DEFAULT 'scheduled',
   admin_token TEXT NOT NULL UNIQUE,
   public_token TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  -- All datetime fields store UTC ISO-8601 strings (e.g. '2024-11-01T14:00:00.000Z').
+  -- The timezone column records the display timezone for the event (e.g. 'America/New_York')
+  -- and is used at read-time to render human-friendly local times.
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),  -- UTC
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))   -- UTC
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_admin_token ON events(admin_token);
