@@ -16,6 +16,10 @@ id = "1f8e09cbac794744a208e6b15a0dcaaa"
 binding = "BUCKET"
 bucket_name = "open-house-photos"
 
+[[routes]]
+pattern = "openhouse.primeamericarealestate.com"
+custom_domain = true
+
 [vars]
 ADMIN_SECRET = "change-this-secret-in-production"
-APP_URL = "https://open-house.workers.dev"
+APP_URL = "https://openhouse.primeamericarealestate.com"
