@@ -301,6 +301,11 @@ type Variables = {
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
+app.onError((err, c) => {
+  console.error('Global Error Handler:', err);
+  return c.html(pageShell('Error', `<div class="p-10 text-center"><h1 class="text-xl font-bold text-red-600 mb-4">Internal Server Error</h1><pre class="bg-gray-100 p-4 rounded text-left overflow-auto text-xs">${err.stack || err.message}</pre></div>`));
+});
+
 // ---------------------------------------------------------------------------
 // Root redirect & Middleware
 // ---------------------------------------------------------------------------
@@ -2077,12 +2082,17 @@ function copyText(id) {
 // ---------------------------------------------------------------------------
 
 app.get('/admin/settings', async (c) => {
-  const user = c.get('user') as any;
-  const company = await c.env.DB.prepare('SELECT * FROM companies WHERE id = (SELECT company_id FROM users WHERE id = ?)')
-    .bind(user.id)
-    .first<Company>();
+  try {
+    const user = c.get('user') as any;
+    console.log('GET /admin/settings - User:', JSON.stringify(user));
+    
+    const company = await c.env.DB.prepare('SELECT * FROM companies WHERE id = (SELECT company_id FROM users WHERE id = ?)')
+      .bind(user.id)
+      .first<Company>();
+    
+    console.log('GET /admin/settings - Company:', JSON.stringify(company));
 
-  const body = `
+    const body = `
 ${adminNav(c)}
 <div class="max-w-2xl mx-auto px-4 py-10">
   <h1 class="text-2xl font-bold text-gray-900 mb-6">Company Branding<\/h1>
@@ -2105,7 +2115,11 @@ ${adminNav(c)}
     <\/form>
   <\/div>
 <\/div>`;
-  return c.html(pageShell('Settings', body));
+    return c.html(pageShell('Settings', body));
+  } catch (err: any) {
+    console.error('Error in GET /admin/settings:', err);
+    throw err;
+  }
 });
 
 app.post('/admin/settings', async (c) => {
