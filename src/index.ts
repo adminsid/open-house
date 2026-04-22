@@ -1359,6 +1359,9 @@ app.post('/admin/events/:adminToken/update', async (c) => {
   const form = await c.req.formData();
   const now = new Date().toISOString();
 
+  const startTimeUtc = toUtc((form.get('start_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
+  const endTimeUtc = toUtc((form.get('end_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
+
   await c.env.DB.prepare(
     `UPDATE events SET
       title = ?, property_address = ?, agent_name = ?, agent_email = ?, agent_phone = ?,
@@ -1374,8 +1377,8 @@ app.post('/admin/events/:adminToken/update', async (c) => {
       (form.get('agent_phone') as string | null)?.trim() || null,
       (form.get('company_name') as string | null)?.trim() || null,
       (form.get('description') as string | null)?.trim() || null,
-      (form.get('start_time') as string)?.trim(),
-      (form.get('end_time') as string)?.trim(),
+      startTimeUtc,
+      endTimeUtc,
       (form.get('timezone') as string)?.trim() || 'America/New_York',
       (form.get('listing_url') as string | null)?.trim() || null,
       now,
@@ -2439,9 +2442,25 @@ function eventFormFields(ev?: Event): string {
     })
     .join('');
 
+  const fromUtc = (utcIso: string, timezone: string) => {
+    try {
+      const d = new Date(utcIso);
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false
+      }).formatToParts(d);
+      const get = (t: string) => parts.find(p => p.type === t)?.value;
+      return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}`;
+    } catch {
+      return utcIso.slice(0, 16);
+    }
+  };
+
   const toLocal = (iso: string | undefined) => {
     if (!iso) return '';
-    return iso.slice(0, 16);
+    const timezone = ev?.timezone || 'America/New_York';
+    return fromUtc(iso, timezone);
   };
 
   return `
