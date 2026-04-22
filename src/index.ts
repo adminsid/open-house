@@ -128,6 +128,17 @@ function followUpBadge(status: string): string {
   return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}">${label}</span>`;
 }
 
+function toUtc(localIso: string, timezone: string): string {
+  try {
+    const d = new Date(localIso);
+    const tzDate = new Date(d.toLocaleString('en-US', { timeZone: timezone }));
+    const diff = d.getTime() - tzDate.getTime();
+    return new Date(d.getTime() + diff).toISOString();
+  } catch {
+    return new Date(localIso).toISOString();
+  }
+}
+
 function formatDateTime(iso: string, timezone: string): string {
   try {
     return new Intl.DateTimeFormat('en-US', {
@@ -138,6 +149,19 @@ function formatDateTime(iso: string, timezone: string): string {
   } catch {
     return iso;
   }
+}
+
+function icon(name: 'map' | 'clock' | 'user' | 'mail' | 'phone' | 'calendar' | 'external', cls = 'w-4 h-4'): string {
+  const paths: Record<string, string> = {
+    map: '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
+    clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+    mail: '<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>',
+    phone: '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.81 12.81 0 0 0 .62 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.62A2 2 0 0 1 22 16.92z"/>',
+    calendar: '<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+    external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>'
+  };
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${cls}">${paths[name]}</svg>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,9 +175,9 @@ function pageShell(title: string, body: string, extraHead = ''): string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>${escHtml(title)} | Open House</title>
-  <script src="https://cdn.tailwindcss.com"><\/script>
+  <script src="https://cdn.tailwindcss.com"></script>
   ${extraHead}
-  <style>[x-cloak]{display:none}<\/style>
+  <style>[x-cloak]{display:none}</style>
 </head>
 <body class="bg-gray-50 min-h-screen">
   ${body}
@@ -161,14 +185,25 @@ function pageShell(title: string, body: string, extraHead = ''): string {
 </html>`;
 }
 
-function guestPageShell(title: string, body: string): string {
+function guestPageShell(title: string, body: string, meta?: { description: string, image: string | null, url: string }): string {
+  const ogTags = meta ? `
+  <meta name="description" content="${escAttr(meta.description)}" />
+  <meta property="og:title" content="${escAttr(title)}" />
+  <meta property="og:description" content="${escAttr(meta.description)}" />
+  ${meta.image ? `<meta property="og:image" content="${escAttr(meta.image)}" />` : ''}
+  <meta property="og:url" content="${escAttr(meta.url)}" />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary_large_image" />
+  ` : '';
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>${escHtml(title)}</title>
-  <script src="https://cdn.tailwindcss.com"><\/script>
+  ${ogTags}
+  <script src="https://cdn.tailwindcss.com"></script>
   <style>
     :root { --gold: #c9a84c; --navy: #0f1c2e; }
     body { background-color: var(--navy); }
@@ -208,7 +243,7 @@ function guestPageShell(title: string, body: string): string {
     .anim-1 { animation: fadeUp 0.55s ease-out 0.05s both; }
     .anim-2 { animation: fadeUp 0.55s ease-out 0.18s both; }
     .anim-3 { animation: fadeUp 0.55s ease-out 0.30s both; }
-  <\/style>
+  </style>
 </head>
 <body>
   ${body}
@@ -643,21 +678,29 @@ app.get('/e/:token', async (c) => {
   ${heroHtml}
   <div class="max-w-lg mx-auto px-4 pb-12 -mt-3 relative">
     <div class="glass-card rounded-2xl shadow-2xl p-5 mb-4 anim-1">
-      <h1 class="text-lg font-bold text-gray-900 leading-tight mb-1">${escHtml(event.title)}<\/h1>
-      <p class="text-gray-500 text-sm mb-0.5">&#128205; ${escHtml(event.property_address)}<\/p>
-      <p class="text-gray-500 text-sm">&#128336; ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}<\/p>
-      ${event.description ? `<div class="divider my-3"><\/div><p class="text-gray-500 text-sm italic">${escHtml(event.description)}<\/p>` : ''}
-      ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-sm font-medium mt-2" style="color:var(--gold)">View Listing &#8599;<\/a>` : ''}
-    <\/div>
+      <h1 class="text-lg font-bold text-gray-900 leading-tight mb-1">${escHtml(event.title)}</h1>
+      <a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(event.property_address)}" target="_blank" class="text-gray-500 text-sm mb-0.5 flex items-center gap-1.5 hover:text-indigo-600">
+        ${icon('map', 'w-3.5 h-3.5')} ${escHtml(event.property_address)}
+      </a>
+      <p class="text-gray-500 text-sm flex items-center gap-1.5">
+        ${icon('clock', 'w-3.5 h-3.5')} ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}
+      </p>
+      ${event.description ? `<div class="divider my-3"></div><p class="text-gray-500 text-sm italic">${escHtml(event.description)}</p>` : ''}
+      ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 text-sm font-medium mt-2" style="color:var(--gold)">View Listing ${icon('external', 'w-3.5 h-3.5')}</a>` : ''}
+    </div>
     ${formHtml}
     <div class="text-center mt-6 text-slate-500 text-xs space-y-2">
       ${equalHousingLogo('text-slate-400')}
-      <p class="text-slate-600">Powered by Open House Sign-in<\/p>
-    <\/div>
-  <\/div>
-<\/div>`;
+      <p class="text-slate-600">Powered by Open House Sign-in</p>
+    </div>
+  </div>
+</div>`;
 
-  return c.html(guestPageShell(event.title, body));
+  return c.html(guestPageShell(event.title, body, {
+    description: `Open House at ${event.property_address}. Hosted by ${event.agent_name}.`,
+    image: photoUrl ? `${c.env.APP_URL}${photoUrl}` : null,
+    url: `${c.env.APP_URL}/e/${token}`
+  }));
 });
 
 // ---------------------------------------------------------------------------
@@ -969,12 +1012,15 @@ app.post('/admin/events/new', async (c) => {
   const rsvp_token = generateToken(16);
   const now = new Date().toISOString();
 
+  const startUtc = toUtc(start_time, timezone);
+  const endUtc = toUtc(end_time, timezone);
+
   try {
     await c.env.DB.prepare(
       `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
     )
-      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, admin_token, public_token, rsvp_token, now, now)
+      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token, rsvp_token, now, now)
       .run();
 
     return c.redirect(`/admin/events/${admin_token}`);
@@ -2143,62 +2189,66 @@ app.get('/rsvp/:rsvpToken', async (c) => {
       <\/div>`
     : `<div class="glass-card rounded-2xl shadow-xl p-6 anim-2">
         <div class="text-center mb-5">
-          <h2 class="text-xl font-bold text-gray-900">RSVP to This Open House<\/h2>
-          <p class="text-gray-500 text-sm mt-1">Reserve your spot &mdash; we&rsquo;d love to see you there<\/p>
-          <div class="divider mt-4"><\/div>
-        <\/div>
+          <h2 class="text-xl font-bold text-gray-900">RSVP to This Open House</h2>
+          <p class="text-gray-500 text-sm mt-1">Reserve your spot &mdash; we&rsquo;d love to see you there</p>
+          <div class="divider mt-4"></div>
+        </div>
         <form method="POST" action="/rsvp/${escHtml(rsvpToken)}/submit" class="space-y-4">
           <div class="grid grid-cols-2 gap-3">
             <div>
-              <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">First Name <span class="text-red-400">*<\/span><\/label>
+              <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">First Name <span class="text-red-400">*</span></label>
               <input type="text" name="first_name" required autofocus
                 class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
-                placeholder="Jane" \/>
-            <\/div>
+                placeholder="Jane" />
+            </div>
             <div>
-              <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Last Name <span class="text-red-400">*<\/span><\/label>
+              <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Last Name <span class="text-red-400">*</span></label>
               <input type="text" name="last_name" required
                 class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
-                placeholder="Smith" \/>
-            <\/div>
-          <\/div>
+                placeholder="Smith" />
+            </div>
+          </div>
           <div>
-            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Email Address <span class="text-red-400">*<\/span><\/label>
-            <input type="email" name="email" required
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Phone Number <span class="text-red-400">*</span></label>
+            <input type="tel" name="phone" required
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
-              placeholder="jane@example.com" \/>
-          <\/div>
+              placeholder="(555) 000-0000" />
+          </div>
           <div>
-            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Phone Number<\/label>
-            <input type="tel" name="phone"
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Email Address</label>
+            <input type="email" name="email"
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
-              placeholder="(555) 000-0000" \/>
-          <\/div>
+              placeholder="jane@example.com" />
+          </div>
           <div>
-            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Notes \/ Questions<\/label>
+            <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Notes / Questions</label>
             <textarea name="notes" rows="2"
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
-              placeholder="Anything you&rsquo;d like the agent to know&hellip;"><\/textarea>
-          <\/div>
+              placeholder="Anything you'd like to ask?"></textarea>
+          </div>
           <div class="pt-1">
             <button type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
-              &#127968; &nbsp;RSVP Now
-            <\/button>
-          <\/div>
-        <\/form>
-      <\/div>`;
+              Confirm My RSVP
+            </button>
+          </div>
+        </form>
+      </div>`;
 
   const body = `
 <div style="background-color:var(--navy);min-height:100vh">
   ${heroHtml}
   <div class="max-w-lg mx-auto px-4 pb-12 -mt-3 relative">
     <div class="glass-card rounded-2xl shadow-2xl p-5 mb-4 anim-1">
-      <h1 class="text-lg font-bold text-gray-900 leading-tight mb-1">${escHtml(event.title)}<\/h1>
-      <p class="text-gray-500 text-sm mb-0.5">&#128205; ${escHtml(event.property_address)}<\/p>
-      <p class="text-gray-500 text-sm">&#128336; ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}<\/p>
-      ${event.description ? `<div class="divider my-3"><\/div><p class="text-gray-500 text-sm italic">${escHtml(event.description)}<\/p>` : ''}
-      ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-sm font-medium mt-2" style="color:var(--gold)">View Listing &#8599;<\/a>` : ''}
-    <\/div>
+      <h1 class="text-lg font-bold text-gray-900 leading-tight mb-1">${escHtml(event.title)}</h1>
+      <a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(event.property_address)}" target="_blank" class="text-gray-500 text-sm mb-0.5 flex items-center gap-1.5 hover:text-indigo-600">
+        ${icon('map', 'w-3.5 h-3.5')} ${escHtml(event.property_address)}
+      </a>
+      <p class="text-gray-500 text-sm flex items-center gap-1.5">
+        ${icon('clock', 'w-3.5 h-3.5')} ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}
+      </p>
+      ${event.description ? `<div class="divider my-3"></div><p class="text-gray-500 text-sm italic">${escHtml(event.description)}</p>` : ''}
+      ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 text-sm font-medium mt-2" style="color:var(--gold)">View Listing ${icon('external', 'w-3.5 h-3.5')}</a>` : ''}
+    </div>
     ${formHtml}
     <div class="text-center mt-6 text-slate-500 text-xs space-y-2">
       ${equalHousingLogo('text-slate-400')}
@@ -2232,13 +2282,13 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
   const form = await c.req.formData();
   const firstName = (form.get('first_name') as string | null)?.trim() ?? '';
   const lastName = (form.get('last_name') as string | null)?.trim() ?? '';
-  const email = (form.get('email') as string | null)?.trim() ?? '';
+  const phone = (form.get('phone') as string | null)?.trim() ?? '';
 
-  if (!firstName || !lastName || !email) {
+  if (!firstName || !lastName || !phone) {
     return c.redirect(`/rsvp/${rsvpToken}`);
   }
 
-  const phone = (form.get('phone') as string | null)?.trim() || null;
+  const email = (form.get('email') as string | null)?.trim() || null;
   const notes = (form.get('notes') as string | null)?.trim() || null;
   const now = new Date().toISOString();
 
@@ -2282,39 +2332,47 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
 <div style="background-color:var(--navy);min-height:100vh">
   ${photoUrl
     ? `<div class="relative h-40 overflow-hidden">
-         <img src="${escAttr(photoUrl)}" alt="${escAttr(title)}" class="w-full h-full object-cover opacity-50" \/>
-         <div class="hero-overlay absolute inset-0"><\/div>
-       <\/div>`
-    : `<div class="h-20" style="background:linear-gradient(135deg,#1a3557 0%,#0f1c2e 100%)"><\/div>`}
+         <img src="${escAttr(photoUrl)}" alt="${escAttr(title)}" class="w-full h-full object-cover opacity-50" />
+         <div class="hero-overlay absolute inset-0"></div>
+       </div>`
+    : `<div class="h-20" style="background:linear-gradient(135deg,#1a3557 0%,#0f1c2e 100%)"></div>`}
   <div class="max-w-lg mx-auto px-4 pb-12 -mt-6 relative">
     <div class="glass-card rounded-2xl shadow-2xl p-8 text-center anim-1">
-      <div class="text-6xl mb-4">&#9989;<\/div>
-      <h1 class="text-2xl font-bold text-gray-900 mb-2">You&rsquo;re On The List!</h1>
-      <p class="text-gray-600 mb-3">You&rsquo;ve successfully RSVP&rsquo;d for <strong>${escHtml(title)}<\/strong>.<\/p>
-      ${event ? `<p class="text-gray-500 text-sm mb-6">&#128336; ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}<\/p>` : ''}
-      <div class="divider mb-6"><\/div>
+      <div class="text-6xl mb-4">✅</div>
+      <h1 class="text-2xl font-bold text-gray-900 mb-2">You're On The List!</h1>
+      <p class="text-gray-600 mb-3">You've successfully RSVP'd for <strong>${escHtml(title)}</strong>.</p>
+      ${event ? `<p class="text-gray-500 text-sm mb-4 flex items-center justify-center gap-1.5">${icon('clock', 'w-4 h-4')} ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}</p>` : ''}
+      
+      <div class="flex justify-center mb-6">
+        <a href="https://www.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${event?.start_time.replace(/[-:]/g, '').split('.')[0]}Z/${event?.end_time.replace(/[-:]/g, '').split('.')[0]}Z&details=${encodeURIComponent('Open House Sign-in RSVP')}&location=${encodeURIComponent(event?.property_address ?? '')}" 
+           target="_blank" class="inline-flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-indigo-700 transition-colors shadow-md">
+          ${icon('calendar', 'w-4 h-4')} Add to Calendar
+        </a>
+      </div>
+
+      <div class="divider mb-6"></div>
       ${event
         ? `<div class="flex items-center justify-center gap-4">
              <div class="flex-shrink-0">
                ${agentPhotoUrl
-                 ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover" style="border-color:var(--gold)" \/>`
-                 : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold" style="border-color:var(--gold);background:rgba(201,168,76,0.1);color:var(--gold)">${escHtml(initials)}<\/div>`}
-             <\/div>
+                 ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover" style="border-color:var(--gold)" />`
+                 : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold" style="border-color:var(--gold);background:rgba(201,168,76,0.1);color:var(--gold)">${escHtml(initials)}</div>`}
+             </div>
              <div class="text-left">
-               ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest" style="color:var(--gold)">${escHtml(event.company_name)}<\/p>` : ''}
-               <p class="font-semibold text-gray-900 text-sm">${escHtml(event.agent_name)}<\/p>
-               <a href="mailto:${escAttr(event.agent_email)}" class="text-xs text-gray-500 hover:underline">${escHtml(event.agent_email)}<\/a>
-               ${event.agent_phone ? `<p class="text-xs text-gray-500">${escHtml(event.agent_phone)}<\/p>` : ''}
-             <\/div>
-           <\/div>
-           <p class="text-gray-400 text-xs mt-5">We look forward to seeing you there! The agent will be in touch with any updates.<\/p>`
+               ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest" style="color:var(--gold)">${escHtml(event.company_name)}</p>` : ''}
+               <p class="font-semibold text-gray-900 text-sm">${escHtml(event.agent_name)}</p>
+               <a href="mailto:${escAttr(event.agent_email)}" class="text-xs text-gray-500 hover:underline flex items-center gap-1">${icon('mail', 'w-3 h-3')} ${escHtml(event.agent_email)}</a>
+               ${event.agent_phone ? `<a href="tel:${escAttr(event.agent_phone)}" class="text-xs text-gray-500 hover:underline flex items-center gap-1">${icon('phone', 'w-3 h-3')} ${escHtml(event.agent_phone)}</a>` : ''}
+             </div>
+           </div>
+           <p class="text-gray-400 text-xs mt-5">We look forward to seeing you there! The agent will be in touch with any updates.</p>`
         : ''}
       <div class="mt-6 pt-5 border-t border-gray-100">
         ${equalHousingLogo('text-gray-400')}
-      <\/div>
-    <\/div>
-  <\/div>
-<\/div>`;
+      </div>
+    </div>
+  </div>
+</div>`;
 
   return c.html(guestPageShell(`RSVP Confirmed \u2013 ${title}`, body));
 });
@@ -2419,7 +2477,7 @@ function eventFormFields(ev?: Event): string {
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Company \/ Brokerage<\/label>
         <input type="text" name="company_name" value="${escAttr(ev?.company_name ?? '')}"
-          placeholder="e.g. Keller Williams Realty"
+          placeholder="Prime America Real Estate, Inc."
           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
       <\/div>
     <\/div>
