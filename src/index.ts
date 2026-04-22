@@ -219,10 +219,17 @@ function guestPageShell(title: string, body: string): string {
 function adminNav(extra = ''): string {
   return `<nav class="bg-white shadow-sm border-b border-gray-200">
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between h-14">
-      <a href="/admin" class="text-indigo-600 font-bold text-lg tracking-tight">&#127968; Open House Admin<\/a>
-      ${extra}
-    <\/div>
-  <\/nav>`;
+      <div class="flex items-center gap-6">
+        <a href="/admin" class="text-indigo-600 font-bold text-lg tracking-tight">&#127968; Open House Admin</a>
+      </div>
+      <div class="flex items-center gap-4">
+        ${extra}
+        <form action="/logout" method="POST" class="inline">
+          <button type="submit" class="text-gray-500 hover:text-gray-700 text-sm font-medium">Sign Out</button>
+        </form>
+      </div>
+    </div>
+  </nav>`;
 }
 
 function agentNav(agentName: string, companyName: string | null, extra = ''): string {
@@ -266,9 +273,25 @@ app.use('*', async (c, next) => {
       return c.redirect('/setup');
     }
   } else {
-    // If admin exists, disable /setup
+    // Admin exists: Disable /setup
     if (path === '/setup') {
       return c.redirect('/admin');
+    }
+
+    // Protect /admin routes
+    if (path.startsWith('/admin')) {
+      const sessionId = getCookie(c, 'admin_session');
+      if (!sessionId) {
+        return c.redirect('/login');
+      }
+    }
+
+    // Redirect /login to /admin if already logged in
+    if (path === '/login') {
+      const sessionId = getCookie(c, 'admin_session');
+      if (sessionId) {
+        return c.redirect('/admin');
+      }
     }
   }
 
@@ -348,9 +371,99 @@ app.post('/setup', async (c) => {
     .bind(id, username, passwordHash, name, now)
     .run();
 
-  // For now, we'll just redirect to admin. 
-  // In a real app, we might set a session cookie here.
+  setCookie(c, 'admin_session', id, {
+    path: '/',
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Lax',
+    maxAge: 60 * 60 * 24 * 7,
+  });
+
   return c.redirect('/admin');
+});
+
+// ---------------------------------------------------------------------------
+// Auth Flow
+// ---------------------------------------------------------------------------
+
+app.get('/login', (c) => {
+  const body = `
+<div class="min-h-screen flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8 bg-slate-950">
+  <div class="max-w-md w-full space-y-8 bg-white p-10 rounded-2xl shadow-2xl">
+    <div>
+      <div class="mx-auto h-12 w-12 flex items-center justify-center rounded-full bg-indigo-100 text-indigo-600 text-2xl">
+        &#127968;
+      </div>
+      <h2 class="mt-6 text-center text-3xl font-extrabold text-gray-900">
+        Admin Login
+      </h2>
+      <p class="mt-2 text-center text-sm text-gray-600">
+        Please sign in to manage your events.
+      </p>
+    </div>
+    <form class="mt-8 space-y-6" action="/login" method="POST">
+      <div class="rounded-md shadow-sm space-y-4">
+        <div>
+          <label for="username" class="block text-sm font-medium text-gray-700">Username / Email</label>
+          <input id="username" name="username" type="text" required class="appearance-none rounded-lg relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="admin@example.com">
+        </div>
+        <div>
+          <label for="password" class="block text-sm font-medium text-gray-700">Password</label>
+          <input id="password" name="password" type="password" required class="appearance-none rounded-lg relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="••••••••">
+        </div>
+      </div>
+
+      <div>
+        <button type="submit" class="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+          Sign In
+        </button>
+      </div>
+    </form>
+  </div>
+</div>`;
+  return c.html(pageShell('Login', body));
+});
+
+app.post('/login', async (c) => {
+  const form = await c.req.formData();
+  const username = (form.get('username') as string)?.trim();
+  const password = (form.get('password') as string);
+
+  if (!username || !password) {
+    return c.text('Username and password are required', 400);
+  }
+
+  const admin = await c.env.DB.prepare('SELECT * FROM admins WHERE username = ?')
+    .bind(username)
+    .first<Admin>();
+
+  if (admin && admin.password_hash === await hashPassword(password)) {
+    setCookie(c, 'admin_session', admin.id, {
+      path: '/',
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+      maxAge: 60 * 60 * 24 * 7, // 1 week
+    });
+    return c.redirect('/admin');
+  }
+
+  return c.html(pageShell('Login Error', `
+    <div class="min-h-screen flex items-center justify-center bg-gray-100">
+      <div class="bg-white p-8 rounded-lg shadow-md text-center">
+        <h2 class="text-red-600 text-xl font-bold mb-4">Invalid Credentials</h2>
+        <a href="/login" class="text-indigo-600 hover:underline">Try again</a>
+      </div>
+    </div>
+  `), 401);
+});
+
+app.post('/logout', async (c) => {
+  setCookie(c, 'admin_session', '', {
+    path: '/',
+    maxAge: 0,
+  });
+  return c.redirect('/login');
 });
 
 // ---------------------------------------------------------------------------
