@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { getCookie, setCookie } from 'hono/cookie';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -10,6 +11,14 @@ type Bindings = {
   BUCKET: R2Bucket;
   ADMIN_SECRET: string;
   APP_URL: string;
+};
+
+type Admin = {
+  id: string;
+  username: string;
+  password_hash: string;
+  name: string;
+  created_at: string;
 };
 
 type Event = {
@@ -67,6 +76,13 @@ function generateToken(byteLength: number = 16): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(byteLength)))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
+}
+
+async function hashPassword(password: string): Promise<string> {
+  const msgUint8 = new TextEncoder().encode(password);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function getEventStatus(event: Event, now: Date): string {
@@ -228,7 +244,114 @@ function agentNav(agentName: string, companyName: string | null, extra = ''): st
 
 const app = new Hono<{ Bindings: Bindings }>();
 
+// ---------------------------------------------------------------------------
+// Middleware: Setup & Auth
+// ---------------------------------------------------------------------------
+
+app.use('*', async (c, next) => {
+  const path = c.req.path;
+
+  // Always allow API and static-ish routes
+  if (path.startsWith('/api/')) {
+    return await next();
+  }
+
+  // Check if any admin exists
+  const { results } = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').all();
+  const adminExists = results && results.length > 0;
+
+  if (!adminExists) {
+    // If no admin, only allow /setup
+    if (path !== '/setup') {
+      return c.redirect('/setup');
+    }
+  } else {
+    // If admin exists, disable /setup
+    if (path === '/setup') {
+      return c.redirect('/admin');
+    }
+  }
+
+  await next();
+});
+
 app.get('/', (c) => c.redirect('/admin'));
+
+// ---------------------------------------------------------------------------
+// Setup Flow
+// ---------------------------------------------------------------------------
+
+app.get('/setup', async (c) => {
+  const body = `
+<div class="min-h-screen flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8 bg-slate-950">
+  <div class="max-w-md w-full space-y-8 bg-white p-10 rounded-2xl shadow-2xl">
+    <div>
+      <div class="mx-auto h-12 w-12 flex items-center justify-center rounded-full bg-indigo-100 text-indigo-600 text-2xl">
+        &#127968;
+      </div>
+      <h2 class="mt-6 text-center text-3xl font-extrabold text-gray-900">
+        Initialize Open House
+      </h2>
+      <p class="mt-2 text-center text-sm text-gray-600">
+        Create the first administrator account to get started.
+      </p>
+    </div>
+    <form class="mt-8 space-y-6" action="/setup" method="POST">
+      <div class="rounded-md shadow-sm space-y-4">
+        <div>
+          <label for="name" class="block text-sm font-medium text-gray-700">Full Name</label>
+          <input id="name" name="name" type="text" required class="appearance-none rounded-lg relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="John Doe">
+        </div>
+        <div>
+          <label for="username" class="block text-sm font-medium text-gray-700">Username / Email</label>
+          <input id="username" name="username" type="text" required class="appearance-none rounded-lg relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="admin@example.com">
+        </div>
+        <div>
+          <label for="password" class="block text-sm font-medium text-gray-700">Password</label>
+          <input id="password" name="password" type="password" required class="appearance-none rounded-lg relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="••••••••">
+        </div>
+      </div>
+
+      <div>
+        <button type="submit" class="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+          Create Admin Account
+        </button>
+      </div>
+    </form>
+  </div>
+</div>`;
+  return c.html(pageShell('Initial Setup', body));
+});
+
+app.post('/setup', async (c) => {
+  const { results } = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').all();
+  if (results && results.length > 0) {
+    return c.redirect('/admin');
+  }
+
+  const form = await c.req.formData();
+  const name = (form.get('name') as string)?.trim();
+  const username = (form.get('username') as string)?.trim();
+  const password = (form.get('password') as string);
+
+  if (!name || !username || !password) {
+    return c.text('All fields are required', 400);
+  }
+
+  const id = generateId();
+  const passwordHash = await hashPassword(password);
+  const now = new Date().toISOString();
+
+  await c.env.DB.prepare(
+    'INSERT INTO admins (id, username, password_hash, name, created_at) VALUES (?, ?, ?, ?, ?)'
+  )
+    .bind(id, username, passwordHash, name, now)
+    .run();
+
+  // For now, we'll just redirect to admin. 
+  // In a real app, we might set a session cookie here.
+  return c.redirect('/admin');
+});
 
 // ---------------------------------------------------------------------------
 // Photo serving
@@ -733,14 +856,31 @@ app.post('/admin/events/new', async (c) => {
   const rsvp_token = generateToken(16);
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
-  )
-    .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, admin_token, public_token, rsvp_token, now, now)
-    .run();
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
+    )
+      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, admin_token, public_token, rsvp_token, now, now)
+      .run();
 
-  return c.redirect(`/admin/events/${admin_token}`);
+    return c.redirect(`/admin/events/${admin_token}`);
+  } catch (err: any) {
+    console.error('Error creating event:', err);
+    return c.html(
+      pageShell(
+        'Error',
+        `<div class="max-w-2xl mx-auto px-4 py-10">
+          <div class="bg-white rounded-2xl shadow p-8 text-center">
+            <h1 class="text-xl font-bold text-red-600 mb-4">Database Error<\/h1>
+            <p class="text-gray-600 mb-6">${escHtml(err.message || 'Unknown error')}<\/p>
+            <a href="/admin/events/new" class="text-indigo-600 underline">Try again<\/a>
+          </div>
+        </div>`
+      ),
+      500
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
