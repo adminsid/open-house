@@ -1181,7 +1181,7 @@ function filterEvents(q) {
     if (match) visible++;
   });
   const noResults = document.getElementById('no-results');
-  if (noResults) noResults.classList.toggle('hidden', visible > 0 || !term);
+  if (noResults) noResults.classList.toggle('hidden', visible > 0);
 }
 <\/script>`;
 
@@ -1858,17 +1858,32 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  if (event.flyer_key) {
-    await c.env.BUCKET.delete(event.flyer_key).catch((err: unknown) => {
-      console.error('R2 delete error:', err);
-    });
+  // Validate extension against allowlist
+  const allowedFlyerExts: Record<string, string> = {
+    pdf: 'application/pdf',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    gif: 'image/gif',
+    webp: 'image/webp',
+  };
+  const rawExt = (file.name.split('.').pop() ?? '').toLowerCase();
+  const safeContentType = allowedFlyerExts[rawExt];
+  if (!safeContentType) {
+    return c.html(
+      pageShell('Invalid File', `<div class="flex items-center justify-center min-h-screen"><div class="text-center p-8"><h1 class="text-xl font-bold text-red-600 mb-2">Invalid file type<\/h1><p class="text-gray-500 mb-4">Allowed types: PDF, JPG, PNG, GIF, WebP<\/p><a href="/admin/events/${escHtml(adminToken)}" class="text-indigo-600 underline">Go back<\/a><\/div><\/div>`),
+      400
+    );
   }
 
-  const ext = file.name.split('.').pop() ?? 'pdf';
-  const key = `flyers/${event.id}/${generateId()}.${ext}`;
+  if (event.flyer_key) {
+    await c.env.BUCKET.delete(event.flyer_key).catch(() => {});
+  }
+
+  const key = `flyers/${event.id}/${generateId()}.${rawExt}`;
 
   await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: file.type || 'application/octet-stream' },
+    httpMetadata: { contentType: safeContentType },
   });
 
   await c.env.DB.prepare(
@@ -1913,6 +1928,12 @@ app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
 
 app.get('/admin/flyer/:key', async (c) => {
   const key = c.req.param('key');
+  // Validate that the key refers to a flyer owned by an event in the DB
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE flyer_key = ?'
+  ).bind(key).first<Pick<Event, 'id'>>();
+  if (!event) return c.notFound();
+
   const obj = await c.env.BUCKET.get(key);
   if (!obj) return c.notFound();
   const headers = new Headers();
