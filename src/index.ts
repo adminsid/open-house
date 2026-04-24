@@ -36,12 +36,22 @@ type Event = {
   timezone: string;
   listing_url: string | null;
   photo_key: string | null;
+  flyer_key: string | null;
   status: string;
   admin_token: string;
   public_token: string;
   rsvp_token: string | null;
   created_at: string;
   updated_at: string;
+  deleted_at: string | null;
+};
+
+type GuestAnalytics = {
+  event_id: string;
+  total: number;
+  rsvp_count: number;
+  checked_in_count: number;
+  pending_count: number;
 };
 
 type Guest = {
@@ -844,14 +854,111 @@ app.get('/e/:token/success', async (c) => {
 // ---------------------------------------------------------------------------
 
 app.get('/admin', async (c) => {
-  const events = await c.env.DB.prepare(
-    'SELECT * FROM events ORDER BY start_time DESC'
+  const now = new Date();
+  const filter = c.req.query('filter') ?? 'scheduled';
+  const view = c.req.query('view') ?? 'grid';
+
+  // Guest analytics (batch)
+  const analyticsResult = await c.env.DB.prepare(
+    `SELECT event_id,
+       COUNT(*) as total,
+       SUM(is_rsvp) as rsvp_count,
+       SUM(checked_in) as checked_in_count,
+       SUM(CASE WHEN follow_up_status = 'pending' THEN 1 ELSE 0 END) as pending_count
+     FROM guests GROUP BY event_id`
+  ).all<GuestAnalytics>();
+  const analyticsMap = new Map<string, GuestAnalytics>(
+    (analyticsResult.results ?? []).map((a) => [a.event_id, a])
+  );
+
+  if (filter === 'deleted') {
+    // Trash tab: soft-deleted events
+    const trashedEvents = await c.env.DB.prepare(
+      'SELECT * FROM events WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
+    ).all<Event>();
+
+    const trashedCards = (trashedEvents.results ?? [])
+      .map((ev) => {
+        const deletedAgo = ev.deleted_at
+          ? Math.round((now.getTime() - new Date(ev.deleted_at).getTime()) / 1000 / 60 / 60)
+          : 0;
+        const deletedAgoLabel = deletedAgo < 24
+          ? `${deletedAgo}h ago`
+          : `${Math.floor(deletedAgo / 24)}d ago`;
+        return `
+        <div class="bg-white rounded-xl shadow border border-red-100 overflow-hidden opacity-75 hover:opacity-100 transition-opacity"
+             data-search="${escAttr((ev.title + ' ' + ev.property_address + ' ' + ev.agent_name).toLowerCase())}">
+          <div class="p-5">
+            <div class="flex items-start justify-between mb-2 gap-2">
+              <h3 class="font-semibold text-gray-700 text-base leading-tight">${escHtml(ev.title)}<\/h3>
+              <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-700">Deleted<\/span>
+            <\/div>
+            <p class="text-sm text-gray-400 mb-0.5">&#128205; ${escHtml(ev.property_address)}<\/p>
+            <p class="text-sm text-gray-400 mb-1">&#128100; ${escHtml(ev.agent_name)}<\/p>
+            <p class="text-xs text-red-400 mb-4">&#128465; Deleted ${deletedAgoLabel}<\/p>
+            <div class="flex items-center gap-2 flex-wrap">
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/restore" class="inline">
+                <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#8635; Restore<\/button>
+              <\/form>
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/permanent-delete" class="inline"
+                onsubmit="return confirm('Permanently delete this event and ALL its data? This CANNOT be undone.')">
+                <button type="submit" class="inline-flex items-center gap-1 bg-red-600 hover:bg-red-700 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465; Delete Forever<\/button>
+              <\/form>
+            <\/div>
+          <\/div>
+        <\/div>`;
+      })
+      .join('');
+
+    const deletedCount = trashedEvents.results?.length ?? 0;
+    const tabs2 = buildTabBar(filter, {}, view);
+
+    const body = `
+${adminNav(`<a href="/admin/events/new" class="inline-flex items-center gap-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors">+ New Event<\/a>`)}
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+  <div class="flex items-center justify-between mb-5">
+    <h1 class="text-2xl font-bold text-gray-900">Events<\/h1>
+  <\/div>
+  ${tabs2}
+  ${deletedCount === 0
+    ? `<div class="text-center py-20"><p class="text-gray-400 text-lg">Trash is empty.<\/p><\/div>`
+    : `<div class="mb-4">
+        <input type="text" id="search-input" placeholder="&#128269; Search events&hellip;"
+          oninput="filterEvents(this.value)"
+          class="w-full sm:w-80 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" \/>
+       <\/div>
+       <div id="events-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">${trashedCards}<\/div>
+       <p id="no-results" class="hidden text-center text-gray-400 py-10">No matching events.<\/p>`}
+<\/div>
+<script>
+function filterEvents(q) {
+  const term = q.toLowerCase().trim();
+  const cards = document.querySelectorAll('[data-search]');
+  let visible = 0;
+  cards.forEach(function(card) {
+    const match = !term || card.dataset.search.includes(term);
+    card.style.display = match ? '' : 'none';
+    if (match) visible++;
+  });
+  const noResults = document.getElementById('no-results');
+  if (noResults) noResults.classList.toggle('hidden', visible > 0);
+}
+<\/script>`;
+
+    return c.html(pageShell('Admin Dashboard', body));
+  }
+
+  // Normal tabs: exclude soft-deleted events
+  const eventsResult = await c.env.DB.prepare(
+    'SELECT * FROM events WHERE deleted_at IS NULL ORDER BY start_time DESC'
   ).all<Event>();
 
-  const now = new Date();
-  const filter = c.req.query('filter') ?? 'all';
+  const deletedCountResult = await c.env.DB.prepare(
+    'SELECT COUNT(*) as cnt FROM events WHERE deleted_at IS NOT NULL'
+  ).first<{ cnt: number }>();
+  const deletedCount = deletedCountResult?.cnt ?? 0;
 
-  const allEvents = (events.results ?? []).map((ev) => ({
+  const allEvents = (eventsResult.results ?? []).map((ev) => ({
     ev,
     liveStatus: getEventStatus(ev, now),
   }));
@@ -868,42 +975,33 @@ app.get('/admin', async (c) => {
     ended: allEvents.filter((e) => e.liveStatus === 'ended').length,
     cancelled: allEvents.filter((e) => e.liveStatus === 'cancelled').length,
     achieved: allEvents.filter((e) => e.liveStatus === 'achieved').length,
+    deleted: deletedCount,
   };
 
-  const tabs: { key: string; label: string }[] = [
-    { key: 'all', label: 'All' },
-    { key: 'happening_now', label: 'Live Now' },
-    { key: 'scheduled', label: 'Upcoming' },
-    { key: 'ended', label: 'Past' },
-    { key: 'cancelled', label: 'Cancelled' },
-    { key: 'achieved', label: 'Achieved' },
-  ];
+  const tabBar = buildTabBar(filter, counts, view);
 
-  const tabBar = `<div class="flex gap-1.5 flex-wrap mb-6">
-    ${tabs
-      .map(({ key, label }) => {
-        const count = counts[key] ?? 0;
-        const active = filter === key;
-        return `<a href="/admin?filter=${key}"
-          class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-            active
-              ? 'bg-indigo-600 text-white shadow-sm'
-              : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'
-          }">
-          ${label}
-          <span class="${active ? 'bg-indigo-500 text-indigo-100' : 'bg-gray-100 text-gray-500'} text-xs px-1.5 py-0.5 rounded-full">${count}<\/span>
-        <\/a>`;
-      })
-      .join('')}
-  <\/div>`;
+  // Build event data for calendar view
+  const calendarData = filtered.map(({ ev, liveStatus }) => ({
+    id: ev.id,
+    title: ev.title,
+    date: ev.start_time.slice(0, 10),
+    status: liveStatus,
+    url: `/admin/events/${ev.admin_token}`,
+  }));
 
-  const cards = filtered
+  const gridCards = filtered
     .map(({ ev, liveStatus }) => {
       const photoUrl = ev.photo_key
         ? `/api/photo/${encodeURIComponent(ev.photo_key)}`
         : null;
+      const a = analyticsMap.get(ev.id);
+      const totalGuests = a?.total ?? 0;
+      const rsvpCount = a?.rsvp_count ?? 0;
+      const checkedIn = a?.checked_in_count ?? 0;
+      const searchText = (ev.title + ' ' + ev.property_address + ' ' + ev.agent_name + ' ' + (ev.company_name ?? '')).toLowerCase();
       return `
-      <div class="bg-white rounded-xl shadow hover:shadow-md transition-shadow border border-gray-100 overflow-hidden">
+      <div class="bg-white rounded-xl shadow hover:shadow-md transition-shadow border border-gray-100 overflow-hidden"
+           data-search="${escAttr(searchText)}">
         ${photoUrl ? `<div class="h-36 overflow-hidden"><img src="${escAttr(photoUrl)}" alt="" class="w-full h-full object-cover" \/><\/div>` : ''}
         <div class="p-5">
           <div class="flex items-start justify-between mb-2 gap-2">
@@ -912,15 +1010,32 @@ app.get('/admin', async (c) => {
           <\/div>
           <p class="text-sm text-gray-500 mb-0.5">&#128205; ${escHtml(ev.property_address)}<\/p>
           <p class="text-sm text-gray-500 mb-1">&#128100; ${escHtml(ev.agent_name)}${ev.company_name ? ` &middot; ${escHtml(ev.company_name)}` : ''}<\/p>
-          <p class="text-xs text-gray-400 mb-4">&#128336; ${formatDateTime(ev.start_time, ev.timezone)}<\/p>
+          <p class="text-xs text-gray-400 mb-3">&#128336; ${formatDateTime(ev.start_time, ev.timezone)}<\/p>
+          <div class="flex items-center gap-3 mb-4 py-2.5 px-3 bg-gray-50 rounded-lg">
+            <div class="text-center flex-1">
+              <p class="text-base font-bold text-gray-800">${totalGuests}<\/p>
+              <p class="text-xs text-gray-500">Guests<\/p>
+            <\/div>
+            <div class="w-px h-8 bg-gray-200"><\/div>
+            <div class="text-center flex-1">
+              <p class="text-base font-bold text-purple-600">${rsvpCount}<\/p>
+              <p class="text-xs text-gray-500">RSVPs<\/p>
+            <\/div>
+            <div class="w-px h-8 bg-gray-200"><\/div>
+            <div class="text-center flex-1">
+              <p class="text-base font-bold text-green-600">${checkedIn}<\/p>
+              <p class="text-xs text-gray-500">Check-ins<\/p>
+            <\/div>
+          <\/div>
           <div class="flex items-center gap-2 flex-wrap">
             <a href="/admin/events/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#9998; Manage<\/a>
-            <a href="/agent/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128100; Agent View<\/a>
+            <a href="/agent/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128100; Agent<\/a>
             <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/duplicate" class="inline">
-              <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Duplicate<\/button>
+              <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Copy<\/button>
             <\/form>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline" onsubmit="return confirm('Delete this event and all its guests? This cannot be undone.')">
-              <button type="submit" class="inline-flex items-center gap-1 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465; Delete<\/button>
+            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
+              onsubmit="return confirm('Move this event to Trash?')">
+              <button type="submit" class="inline-flex items-center gap-1 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465;<\/button>
             <\/form>
           <\/div>
         <\/div>
@@ -928,26 +1043,195 @@ app.get('/admin', async (c) => {
     })
     .join('');
 
+  const listRows = filtered
+    .map(({ ev, liveStatus }) => {
+      const a = analyticsMap.get(ev.id);
+      const totalGuests = a?.total ?? 0;
+      const rsvpCount = a?.rsvp_count ?? 0;
+      const searchText = (ev.title + ' ' + ev.property_address + ' ' + ev.agent_name + ' ' + (ev.company_name ?? '')).toLowerCase();
+      return `
+      <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0"
+          data-search="${escAttr(searchText)}">
+        <td class="px-4 py-3">
+          <div class="font-medium text-gray-900 text-sm">${escHtml(ev.title)}<\/div>
+          <div class="text-xs text-gray-400">&#128205; ${escHtml(ev.property_address)}<\/div>
+        <\/td>
+        <td class="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">&#128336; ${formatDateTime(ev.start_time, ev.timezone)}<\/td>
+        <td class="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">&#128100; ${escHtml(ev.agent_name)}<\/td>
+        <td class="px-4 py-3">${statusBadge(liveStatus)}<\/td>
+        <td class="px-4 py-3 text-sm text-center">
+          <span class="font-semibold text-gray-800">${totalGuests}<\/span>
+          ${rsvpCount > 0 ? `<span class="ml-1 text-xs text-purple-600">(${rsvpCount} RSVP)<\/span>` : ''}
+        <\/td>
+        <td class="px-4 py-3">
+          <div class="flex items-center gap-2 flex-wrap">
+            <a href="/admin/events/${escHtml(ev.admin_token)}" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded-lg">&#9998; Manage<\/a>
+            <a href="/agent/${escHtml(ev.admin_token)}" class="bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-2 py-1 rounded-lg">Agent<\/a>
+            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
+              onsubmit="return confirm('Move this event to Trash?')">
+              <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-2 py-1 rounded-lg">&#128465;<\/button>
+            <\/form>
+          <\/div>
+        <\/td>
+      <\/tr>`;
+    })
+    .join('');
+
+  const emptyLabel = filter === 'all'
+    ? 'No events yet.'
+    : `No ${filter.replace(/_/g, ' ')} events.`;
+
   const body = `
 ${adminNav(`<a href="/admin/events/new" class="inline-flex items-center gap-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors">+ New Event<\/a>`)}
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
   <div class="flex items-center justify-between mb-5">
     <h1 class="text-2xl font-bold text-gray-900">Events<\/h1>
-    <span class="text-sm text-gray-500">${filtered.length} of ${allEvents.length} event(s)<\/span>
+    <span class="text-sm text-gray-500">${filtered.length} event(s)<\/span>
   <\/div>
   ${tabBar}
-  ${
-    filtered.length === 0
-      ? `<div class="text-center py-20">
-          <p class="text-gray-400 text-lg mb-4">No ${filter === 'all' ? '' : filter.replace(/_/g, ' ') + ' '}events yet.<\/p>
-          ${filter === 'all' ? `<a href="/admin/events/new" class="inline-flex items-center gap-1 bg-indigo-600 text-white font-medium px-5 py-2.5 rounded-lg hover:bg-indigo-700 transition-colors">Create your first event<\/a>` : ''}
-         <\/div>`
-      : `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">${cards}<\/div>`
-  }
-<\/div>`;
+  ${filtered.length === 0
+    ? `<div class="text-center py-20">
+        <p class="text-gray-400 text-lg mb-4">${emptyLabel}<\/p>
+        ${filter === 'all' ? `<a href="/admin/events/new" class="inline-flex items-center gap-1 bg-indigo-600 text-white font-medium px-5 py-2.5 rounded-lg hover:bg-indigo-700 transition-colors">Create your first event<\/a>` : ''}
+       <\/div>`
+    : `
+  <div class="flex items-center gap-3 mb-4 flex-wrap">
+    <input type="text" id="search-input" placeholder="&#128269; Search by title, address, or agent&hellip;"
+      oninput="filterEvents(this.value)"
+      class="flex-1 min-w-0 sm:max-w-sm rounded-lg border border-gray-300 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" \/>
+  <\/div>
+
+  ${view === 'list'
+    ? `<div class="bg-white rounded-xl shadow overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="min-w-full">
+            <thead>
+              <tr class="bg-gray-50 text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-100">
+                <th class="px-4 py-3 text-left">Event<\/th>
+                <th class="px-4 py-3 text-left">Date<\/th>
+                <th class="px-4 py-3 text-left">Agent<\/th>
+                <th class="px-4 py-3 text-left">Status<\/th>
+                <th class="px-4 py-3 text-center">Guests<\/th>
+                <th class="px-4 py-3 text-left">Actions<\/th>
+              <\/tr>
+            <\/thead>
+            <tbody id="events-list">
+              ${listRows}
+            <\/tbody>
+          <\/table>
+        <\/div>
+       <\/div>`
+    : view === 'calendar'
+    ? `<div id="calendar-container" class="bg-white rounded-xl shadow p-6"><\/div>
+       <script>
+       (function(){
+         const events = ${JSON.stringify(calendarData)};
+         let year = new Date().getFullYear();
+         let month = new Date().getMonth();
+         function render() {
+           const container = document.getElementById('calendar-container');
+           if (!container) return;
+           const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+           const firstDay = new Date(year, month, 1).getDay();
+           const daysInMonth = new Date(year, month+1, 0).getDate();
+           const todayStr = new Date().toISOString().slice(0,10);
+           let html = '<div class="flex items-center justify-between mb-4">'
+             + '<button onclick="prevMonth()" class="p-2 rounded-lg hover:bg-gray-100 text-gray-600 font-bold text-lg">&lsaquo;<\/button>'
+             + '<h2 class="text-lg font-semibold text-gray-800">' + monthNames[month] + ' ' + year + '<\/h2>'
+             + '<button onclick="nextMonth()" class="p-2 rounded-lg hover:bg-gray-100 text-gray-600 font-bold text-lg">&rsaquo;<\/button>'
+             + '<\/div>';
+           html += '<div class="grid grid-cols-7 gap-1 mb-1">';
+           ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d => {
+             html += '<div class="text-center text-xs font-semibold text-gray-400 py-1">' + d + '<\/div>';
+           });
+           html += '<\/div><div class="grid grid-cols-7 gap-1">';
+           for (let i=0; i<firstDay; i++) html += '<div><\/div>';
+           for (let d=1; d<=daysInMonth; d++) {
+             const dateStr = year + '-' + String(month+1).padStart(2,'0') + '-' + String(d).padStart(2,'0');
+             const dayEvents = events.filter(e => e.date === dateStr);
+             const isToday = dateStr === todayStr;
+             html += '<div class="min-h-[60px] p-1 rounded-lg border ' + (isToday ? 'border-indigo-300 bg-indigo-50' : 'border-gray-100 hover:bg-gray-50') + '">'
+               + '<div class="text-xs font-medium ' + (isToday ? 'text-indigo-600' : 'text-gray-500') + ' mb-1">' + d + '<\/div>';
+             dayEvents.forEach(e => {
+               const colors = {happening_now:'bg-green-100 text-green-800',scheduled:'bg-blue-100 text-blue-800',ended:'bg-gray-100 text-gray-600',cancelled:'bg-red-100 text-red-700',achieved:'bg-purple-100 text-purple-700'};
+               const cls = colors[e.status] || 'bg-gray-100 text-gray-600';
+               html += '<a href="' + e.url + '" class="block text-xs px-1 py-0.5 rounded mb-0.5 truncate ' + cls + '" title="' + e.title.replace(/"/g,\\"&quot;\\") + '">' + e.title.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '<\/a>';
+             });
+             html += '<\/div>';
+           }
+           html += '<\/div>';
+           container.innerHTML = html;
+         }
+         window.prevMonth = function() { month--; if(month<0){month=11;year--;} render(); };
+         window.nextMonth = function() { month++; if(month>11){month=0;year++;} render(); };
+         render();
+       })();
+       <\/script>`
+    : `<div id="events-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">${gridCards}<\/div>`}
+  <p id="no-results" class="hidden text-center text-gray-400 py-10">No matching events.<\/p>`}
+<\/div>
+<script>
+function filterEvents(q) {
+  const term = q.toLowerCase().trim();
+  const rows = document.querySelectorAll('[data-search]');
+  let visible = 0;
+  rows.forEach(function(row) {
+    const match = !term || row.dataset.search.includes(term);
+    row.style.display = match ? '' : 'none';
+    if (match) visible++;
+  });
+  const noResults = document.getElementById('no-results');
+  if (noResults) noResults.classList.toggle('hidden', visible > 0);
+}
+<\/script>`;
 
   return c.html(pageShell('Admin Dashboard', body));
 });
+
+function buildTabBar(activeFilter: string, counts: Record<string, number>, view: string): string {
+  const tabs: { key: string; label: string; icon: string }[] = [
+    { key: 'scheduled', label: 'Upcoming', icon: '&#128197;' },
+    { key: 'happening_now', label: 'Live Now', icon: '&#127897;' },
+    { key: 'all', label: 'All', icon: '&#128196;' },
+    { key: 'ended', label: 'Past', icon: '&#10003;' },
+    { key: 'cancelled', label: 'Cancelled', icon: '&#10060;' },
+    { key: 'achieved', label: 'Achieved', icon: '&#11088;' },
+    { key: 'deleted', label: 'Trash', icon: '&#128465;' },
+  ];
+
+  const viewButtons = activeFilter !== 'deleted'
+    ? `<div class="ml-auto flex items-center gap-1 bg-white border border-gray-200 rounded-lg p-0.5">
+        <a href="/admin?filter=${activeFilter}&view=grid" title="Grid view"
+          class="p-1.5 rounded-md text-sm transition-colors ${view === 'grid' ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:bg-gray-100'}">&#8982;<\/a>
+        <a href="/admin?filter=${activeFilter}&view=list" title="List view"
+          class="p-1.5 rounded-md text-sm transition-colors ${view === 'list' ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:bg-gray-100'}">&#9776;<\/a>
+        <a href="/admin?filter=${activeFilter}&view=calendar" title="Calendar view"
+          class="p-1.5 rounded-md text-sm transition-colors ${view === 'calendar' ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:bg-gray-100'}">&#128197;<\/a>
+      <\/div>`
+    : '';
+
+  const tabLinks = tabs
+    .map(({ key, label, icon }) => {
+      const count = counts[key] ?? 0;
+      const active = activeFilter === key;
+      const isDeleted = key === 'deleted';
+      return `<a href="/admin?filter=${key}${key !== 'deleted' ? '&view=' + view : ''}"
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+          active
+            ? isDeleted ? 'bg-red-600 text-white shadow-sm' : 'bg-indigo-600 text-white shadow-sm'
+            : isDeleted ? 'bg-white text-red-600 border border-red-200 hover:bg-red-50' : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'
+        }">
+        ${icon} ${label}
+        ${count > 0 || key === 'all' ? `<span class="${active ? (isDeleted ? 'bg-red-500 text-red-100' : 'bg-indigo-500 text-indigo-100') : (isDeleted ? 'bg-red-100 text-red-600' : 'bg-gray-100 text-gray-500')} text-xs px-1.5 py-0.5 rounded-full">${count}<\/span>` : ''}
+      <\/a>`;
+    })
+    .join('');
+
+  return `<div class="flex gap-1.5 flex-wrap items-center mb-6">
+    ${tabLinks}
+    ${viewButtons}
+  <\/div>`;
+}
 
 // ---------------------------------------------------------------------------
 // Admin: new event form
@@ -1079,8 +1363,18 @@ app.get('/admin/events/:adminToken', async (c) => {
   const agentPhotoUrl = event.agent_photo_key
     ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
     : null;
+  const flyerUrl = event.flyer_key
+    ? `/admin/flyer/${encodeURIComponent(event.flyer_key)}`
+    : null;
 
-  const guestRows = (guests.results ?? [])
+  // Quick analytics
+  const guestList = guests.results ?? [];
+  const totalGuests = guestList.length;
+  const rsvpCount = guestList.filter((g) => g.is_rsvp).length;
+  const checkedInCount = guestList.filter((g) => g.checked_in).length;
+  const pendingCount = guestList.filter((g) => g.follow_up_status === 'pending').length;
+
+  const guestRows = guestList
     .map(
       (g) => `
     <tr class="hover:bg-gray-50">
@@ -1147,10 +1441,32 @@ function closeFollowUp() {
 }
 <\/script>`;
 
+  const deletedBanner = event.deleted_at
+    ? `<div class="bg-red-50 border border-red-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+        <div class="flex items-center gap-2">
+          <span class="text-red-500 text-xl">&#128465;<\/span>
+          <div>
+            <p class="font-semibold text-red-700 text-sm">This event is in the Trash<\/p>
+            <p class="text-xs text-red-500">Deleted ${formatDateTime(event.deleted_at, event.timezone)}<\/p>
+          <\/div>
+        <\/div>
+        <div class="flex gap-2">
+          <form method="POST" action="/admin/events/${escHtml(adminToken)}/restore" class="inline">
+            <button type="submit" class="bg-green-600 hover:bg-green-700 text-white text-sm font-medium px-4 py-1.5 rounded-lg transition-colors">&#8635; Restore<\/button>
+          <\/form>
+          <form method="POST" action="/admin/events/${escHtml(adminToken)}/permanent-delete" class="inline"
+            onsubmit="return confirm('Permanently delete this event and ALL its data? This CANNOT be undone.')">
+            <button type="submit" class="bg-red-600 hover:bg-red-700 text-white text-sm font-medium px-4 py-1.5 rounded-lg transition-colors">&#128465; Delete Forever<\/button>
+          <\/form>
+        <\/div>
+      <\/div>`
+    : '';
+
   const body = `
 ${adminNav(`<a href="/admin" class="text-sm text-gray-500 hover:text-gray-700">&larr; All Events<\/a>`)}
 ${followUpModal}
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+  ${deletedBanner}
 
   <div class="flex flex-wrap items-start gap-4 justify-between">
     <div>
@@ -1180,10 +1496,32 @@ ${followUpModal}
             <\/form>`
           : ''
       }
-      <form method="POST" action="/admin/events/${escHtml(adminToken)}/delete" class="inline"
-        onsubmit="return confirm('Permanently delete this event and ALL its guests? This cannot be undone.')">
-        <button type="submit" class="bg-red-600 hover:bg-red-700 text-white text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465; Delete<\/button>
-      <\/form>
+      ${!event.deleted_at
+        ? `<form method="POST" action="/admin/events/${escHtml(adminToken)}/delete" class="inline"
+            onsubmit="return confirm('Move this event to Trash? You can restore it later.')">
+            <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465; Move to Trash<\/button>
+          <\/form>`
+        : ''}
+    <\/div>
+  <\/div>
+
+  <!-- Quick analytics strip -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+    <div class="bg-white rounded-xl shadow p-4 text-center">
+      <p class="text-2xl font-bold text-gray-900">${totalGuests}<\/p>
+      <p class="text-xs text-gray-500 mt-0.5">Total Guests<\/p>
+    <\/div>
+    <div class="bg-white rounded-xl shadow p-4 text-center">
+      <p class="text-2xl font-bold text-purple-600">${rsvpCount}<\/p>
+      <p class="text-xs text-gray-500 mt-0.5">RSVPs<\/p>
+    <\/div>
+    <div class="bg-white rounded-xl shadow p-4 text-center">
+      <p class="text-2xl font-bold text-green-600">${checkedInCount}<\/p>
+      <p class="text-xs text-gray-500 mt-0.5">Checked In<\/p>
+    <\/div>
+    <div class="bg-white rounded-xl shadow p-4 text-center">
+      <p class="text-2xl font-bold text-yellow-600">${pendingCount}<\/p>
+      <p class="text-xs text-gray-500 mt-0.5">Pending Follow-up<\/p>
     <\/div>
   <\/div>
 
@@ -1246,6 +1584,30 @@ ${followUpModal}
           <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">Upload Agent Photo<\/button>
         <\/form>
       <\/div>
+
+      <div class="bg-white rounded-xl shadow p-5 border-l-4 border-amber-400">
+        <h2 class="font-semibold text-gray-900 mb-1">Event Flyer<\/h2>
+        <p class="text-xs text-gray-500 mb-3">Upload a PDF or image flyer. Visible to admins only.<\/p>
+        ${flyerUrl
+          ? `<div class="mb-3 flex items-center gap-2 p-3 bg-amber-50 rounded-lg">
+              <span class="text-amber-600 text-lg">&#128196;<\/span>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-medium text-gray-700 truncate">Flyer attached<\/p>
+              <\/div>
+              <a href="${escAttr(flyerUrl)}" target="_blank"
+                class="bg-amber-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-amber-700 transition-colors whitespace-nowrap">&#11015; View<\/a>
+            <\/div>
+            <form method="POST" action="/admin/events/${escHtml(adminToken)}/flyer/delete" class="mb-2">
+              <button type="submit" onclick="return confirm('Remove this flyer?')"
+                class="w-full bg-gray-100 hover:bg-gray-200 text-gray-600 text-xs font-medium py-1.5 rounded-lg transition-colors">Remove Flyer<\/button>
+            <\/form>`
+          : '<p class="text-sm text-gray-400 mb-3">No flyer uploaded yet.<\/p>'}
+        <form method="POST" action="/admin/events/${escHtml(adminToken)}/flyer" enctype="multipart/form-data" class="space-y-2">
+          <input type="file" name="flyer" accept="image\/*,.pdf"
+            class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-amber-50 file:text-amber-700 hover:file:bg-amber-100" \/>
+          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${flyerUrl ? 'Replace Flyer' : 'Upload Flyer'}<\/button>
+        <\/form>
+      <\/div>
     <\/div>
 
     <div class="lg:col-span-2 space-y-6">
@@ -1303,7 +1665,7 @@ ${followUpModal}
 
   <div class="bg-white rounded-xl shadow">
     <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
-      <h2 class="font-semibold text-gray-900">Guests <span class="text-gray-400 font-normal">(${(guests.results ?? []).length})<\/span><\/h2>
+      <h2 class="font-semibold text-gray-900">Guests <span class="text-gray-400 font-normal">(${totalGuests})<\/span><\/h2>
       <a href="/admin/events/${escHtml(adminToken)}/export.csv"
         class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
         &#11015; Export CSV
@@ -1476,8 +1838,110 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// Admin: update guest follow-up
+// Admin: upload event flyer (admin-only)
 // ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/flyer', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id, flyer_key FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'flyer_key'>>();
+
+  if (!event) return c.notFound();
+
+  const form = await c.req.formData();
+  const file = form.get('flyer') as File | null;
+
+  if (!file || file.size === 0) {
+    return c.redirect(`/admin/events/${adminToken}`);
+  }
+
+  // Validate extension against allowlist
+  const allowedFlyerExts: Record<string, string> = {
+    pdf: 'application/pdf',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    gif: 'image/gif',
+    webp: 'image/webp',
+  };
+  const rawExt = (file.name.split('.').pop() ?? '').toLowerCase();
+  const safeContentType = allowedFlyerExts[rawExt];
+  if (!safeContentType) {
+    return c.html(
+      pageShell('Invalid File', `<div class="flex items-center justify-center min-h-screen"><div class="text-center p-8"><h1 class="text-xl font-bold text-red-600 mb-2">Invalid file type<\/h1><p class="text-gray-500 mb-4">Allowed types: PDF, JPG, PNG, GIF, WebP<\/p><a href="/admin/events/${escHtml(adminToken)}" class="text-indigo-600 underline">Go back<\/a><\/div><\/div>`),
+      400
+    );
+  }
+
+  if (event.flyer_key) {
+    await c.env.BUCKET.delete(event.flyer_key).catch(() => {});
+  }
+
+  const key = `flyers/${event.id}/${generateId()}.${rawExt}`;
+
+  await c.env.BUCKET.put(key, file.stream(), {
+    httpMetadata: { contentType: safeContentType },
+  });
+
+  await c.env.DB.prepare(
+    'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(key, new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: delete flyer
+// ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id, flyer_key FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'flyer_key'>>();
+
+  if (!event) return c.notFound();
+
+  if (event.flyer_key) {
+    await c.env.BUCKET.delete(event.flyer_key).catch(() => {});
+  }
+
+  await c.env.DB.prepare(
+    'UPDATE events SET flyer_key = NULL, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: serve flyer (admin-only, protected by middleware)
+// ---------------------------------------------------------------------------
+
+app.get('/admin/flyer/:key', async (c) => {
+  const key = c.req.param('key');
+  // Validate that the key refers to a flyer owned by an event in the DB
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE flyer_key = ?'
+  ).bind(key).first<Pick<Event, 'id'>>();
+  if (!event) return c.notFound();
+
+  const obj = await c.env.BUCKET.get(key);
+  if (!obj) return c.notFound();
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set('content-disposition', `inline; filename="${key.split('/').pop() ?? 'flyer'}"`);
+  headers.set('cache-control', 'private, max-age=3600');
+  return new Response(obj.body, { headers });
+});
 
 app.post('/admin/events/:adminToken/guests/:guestId/followup', async (c) => {
   const adminToken = c.req.param('adminToken');
@@ -1527,16 +1991,62 @@ app.post('/admin/events/:adminToken/status', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// Admin: delete event
+// Admin: delete event (soft delete — moves to Trash)
 // ---------------------------------------------------------------------------
 
 app.post('/admin/events/:adminToken/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key, agent_photo_key FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ?'
   )
     .bind(adminToken)
-    .first<Pick<Event, 'id' | 'photo_key' | 'agent_photo_key'>>();
+    .first<Pick<Event, 'id'>>();
+
+  if (!event) return c.notFound();
+
+  await c.env.DB.prepare(
+    'UPDATE events SET deleted_at = ?, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(new Date().toISOString(), new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect('/admin?filter=deleted');
+});
+
+// ---------------------------------------------------------------------------
+// Admin: restore a soft-deleted event
+// ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/restore', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id'>>();
+
+  if (!event) return c.notFound();
+
+  await c.env.DB.prepare(
+    'UPDATE events SET deleted_at = NULL, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: permanently delete event
+// ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id, photo_key, agent_photo_key, flyer_key FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'photo_key' | 'agent_photo_key' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
 
@@ -1546,10 +2056,13 @@ app.post('/admin/events/:adminToken/delete', async (c) => {
   if (event.agent_photo_key) {
     await c.env.BUCKET.delete(event.agent_photo_key).catch(() => {});
   }
+  if (event.flyer_key) {
+    await c.env.BUCKET.delete(event.flyer_key).catch(() => {});
+  }
 
   await c.env.DB.prepare('DELETE FROM events WHERE id = ?').bind(event.id).run();
 
-  return c.redirect('/admin');
+  return c.redirect('/admin?filter=deleted');
 });
 
 // ---------------------------------------------------------------------------
@@ -2312,10 +2825,10 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
 app.get('/rsvp/:rsvpToken/success', async (c) => {
   const rsvpToken = c.req.param('rsvpToken');
   const event = await c.env.DB.prepare(
-    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, photo_key, start_time, end_time, timezone FROM events WHERE rsvp_token = ?'
+    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, photo_key, start_time, end_time, timezone, property_address FROM events WHERE rsvp_token = ?'
   )
     .bind(rsvpToken)
-    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'photo_key' | 'start_time' | 'end_time' | 'timezone'>>();
+    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'photo_key' | 'start_time' | 'end_time' | 'timezone' | 'property_address'>>();
 
   const title = event?.title ?? 'Open House';
   const photoUrl = event?.photo_key
