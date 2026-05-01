@@ -1481,6 +1481,11 @@ ${followUpModal}
         class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
         &#128100; Agent View
       <\/a>
+      <a href="/admin/events/${escHtml(adminToken)}/signin-sheet.xls"
+        class="inline-flex items-center gap-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors"
+        title="Download printable guest sign-in sheet (Excel)">
+        &#128196; Sign-In Sheet
+      <\/a>
       <form method="POST" action="/admin/events/${escHtml(adminToken)}/duplicate" class="inline">
         <button type="submit" class="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Duplicate<\/button>
       <\/form>
@@ -1666,10 +1671,17 @@ ${followUpModal}
   <div class="bg-white rounded-xl shadow">
     <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
       <h2 class="font-semibold text-gray-900">Guests <span class="text-gray-400 font-normal">(${totalGuests})<\/span><\/h2>
-      <a href="/admin/events/${escHtml(adminToken)}/export.csv"
-        class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
-        &#11015; Export CSV
-      <\/a>
+      <div class="flex gap-2 flex-wrap">
+        <a href="/admin/events/${escHtml(adminToken)}/signin-sheet.xls"
+          class="inline-flex items-center gap-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors"
+          title="Download sign-in sheet (Excel)">
+          &#128196; Sign-In Sheet
+        <\/a>
+        <a href="/admin/events/${escHtml(adminToken)}/export.csv"
+          class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
+          &#11015; Export CSV
+        <\/a>
+      <\/div>
     <\/div>
     <div class="overflow-x-auto">
       <table class="min-w-full divide-y divide-gray-100">
@@ -2892,6 +2904,176 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
 
   return c.html(guestPageShell(`RSVP Confirmed \u2013 ${title}`, body));
 });
+
+// ---------------------------------------------------------------------------
+// Admin: generate sign-in sheet (XLS / HTML-as-Excel)
+// ---------------------------------------------------------------------------
+
+app.get('/admin/events/:adminToken/signin-sheet.xls', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT * FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Event>();
+
+  if (!event) return c.notFound();
+
+  const appUrl = c.env.APP_URL;
+  const signInUrl = `${appUrl}/e/${event.public_token}`;
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(signInUrl)}`;
+  const dateTime = formatSignInSheetDateTime(event);
+
+  const html = buildSignInSheetHtml(event.property_address, dateTime, event.agent_name, qrUrl);
+  const safeTitle = event.property_address.replace(/[^a-z0-9]/gi, '-').toLowerCase().slice(0, 60);
+  const filename = `open-house-signin-${safeTitle}.xls`;
+
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'application/vnd.ms-excel',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    },
+  });
+});
+
+function formatSignInSheetDateTime(event: Event): string {
+  try {
+    const tz = event.timezone;
+    const startDate = new Date(event.start_time);
+    const endDate = new Date(event.end_time);
+
+    const startTime = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour: 'numeric', hour12: true,
+    }).format(startDate).replace(/\s+/g, '').toUpperCase();
+
+    const endTime = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour: 'numeric', hour12: true,
+    }).format(endDate).replace(/\s+/g, '').toUpperCase();
+
+    const dayOfWeek = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, weekday: 'long',
+    }).format(startDate).toUpperCase();
+
+    const date = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, month: 'numeric', day: 'numeric', year: 'numeric',
+    }).format(startDate);
+
+    return `${startTime} TO ${endTime}, ${dayOfWeek}, ${date}`;
+  } catch {
+    return formatDateTime(event.start_time, event.timezone);
+  }
+}
+
+function buildSignInSheetHtml(
+  propertyAddress: string,
+  dateTime: string,
+  host: string,
+  qrUrl: string,
+): string {
+  const COMPANY_LOGO = 'https://inside.primeamericarealestate.com/images/logo.png';
+  const EH_LOGO = 'https://www.nar.realtor/sites/default/files/downloadable/equal-housing-opportunity-logo-1200w.jpg';
+
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  const border = 'border:1px solid #000;';
+  const colHeaderStyle = `${border}font-weight:bold;text-align:center;background-color:#f2f2f2;` +
+    `padding:5px 6px;font-size:10pt;font-family:Arial,sans-serif;vertical-align:middle;`;
+  const dataCellStyle = `${border}height:30px;font-family:Arial,sans-serif;font-size:10pt;padding:2px 5px;`;
+
+  const emptyRows = Array.from({ length: 22 }, () =>
+    `  <tr>
+    <td style="${dataCellStyle}"></td>
+    <td style="${dataCellStyle}"></td>
+    <td style="${dataCellStyle}"></td>
+    <td style="${dataCellStyle}"></td>
+  </tr>`).join('\n');
+
+  return `<html xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:x="urn:schemas-microsoft-com:office:excel"
+ xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<!--[if gte mso 9]><xml>
+ <x:ExcelWorkbook>
+  <x:ExcelWorksheets>
+   <x:ExcelWorksheet>
+    <x:Name>Sign-In Sheet</x:Name>
+    <x:WorksheetOptions>
+     <x:Print>
+      <x:ValidPrinterInfo/>
+      <x:PaperSizeIndex>1</x:PaperSizeIndex>
+      <x:Landscape/>
+      <x:HorizontalResolution>600</x:HorizontalResolution>
+      <x:VerticalResolution>600</x:VerticalResolution>
+     </x:Print>
+    </x:WorksheetOptions>
+   </x:ExcelWorksheet>
+  </x:ExcelWorksheets>
+ </x:ExcelWorkbook>
+</xml><![endif]-->
+<style>
+  table { border-collapse: collapse; }
+  td { vertical-align: middle; }
+  br { mso-data-placement: same-cell; }
+</style>
+</head>
+<body>
+<table cellspacing="0" cellpadding="0"
+  style="border-collapse:collapse;width:750pt;font-family:Arial,sans-serif;">
+  <colgroup>
+    <col style="width:185pt">
+    <col style="width:130pt">
+    <col style="width:185pt">
+    <col style="width:250pt">
+  </colgroup>
+  <!-- Company logo row -->
+  <tr>
+    <td colspan="4" style="text-align:center;border:none;padding:14px 4px 6px;">
+      <img src="${COMPANY_LOGO}" height="90" alt="Company Logo" />
+    </td>
+  </tr>
+  <!-- Sheet title row -->
+  <tr>
+    <td colspan="4" style="${border}text-align:center;font-weight:bold;font-size:13pt;
+      font-family:Arial,sans-serif;padding:7px 4px;letter-spacing:0.5pt;">
+      OPEN HOUSE SIGN-IN SHEET
+    </td>
+  </tr>
+  <!-- Event info / logos row -->
+  <tr>
+    <td colspan="2" style="${border}padding:10px 10px;vertical-align:top;
+      font-family:Arial,sans-serif;font-size:10pt;line-height:1.7;">
+      <b>PROPERTY ADDRESS:</b> ${esc(propertyAddress)}<br>
+      <b>DATE &amp; TIME:</b>&nbsp;${esc(dateTime)}<br>
+      <b>HOST:</b> ${esc(host)}
+    </td>
+    <td style="${border}text-align:center;vertical-align:middle;padding:6px 4px;">
+      <img src="${EH_LOGO}" height="65" alt="Equal Housing Opportunity" /><br>
+      <span style="font-size:7.5pt;font-family:Arial,sans-serif;font-weight:bold;
+        line-height:1.3;display:inline-block;margin-top:3px;">
+        EQUAL HOUSING<br>OPPORTUNITY
+      </span>
+    </td>
+    <td style="${border}text-align:center;vertical-align:middle;padding:6px 4px;
+      font-family:Arial,sans-serif;font-size:9pt;">
+      <span style="font-weight:bold;">Scan For Online Sign In</span><br>
+      <img src="${esc(qrUrl)}" height="95" width="95" alt="QR Code"
+        style="margin-top:4px;" />
+    </td>
+  </tr>
+  <!-- Column header row -->
+  <tr>
+    <td style="${colHeaderStyle}">NAME</td>
+    <td style="${colHeaderStyle}">Is agent representing you?</td>
+    <td style="${colHeaderStyle}">CONTACT NUMBER</td>
+    <td style="${colHeaderStyle}">EMAIL</td>
+  </tr>
+${emptyRows}
+</table>
+</body>
+</html>`;
+}
 
 // ---------------------------------------------------------------------------
 // CSV builder helper
