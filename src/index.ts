@@ -1481,9 +1481,9 @@ ${followUpModal}
         class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
         &#128100; Agent View
       <\/a>
-      <a href="/admin/events/${escHtml(adminToken)}/signin-sheet.xls"
+      <a href="/admin/events/${escHtml(adminToken)}/signin-sheet" target="_blank"
         class="inline-flex items-center gap-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors"
-        title="Download printable guest sign-in sheet (Excel)">
+        title="Open printable guest sign-in sheet">
         &#128196; Sign-In Sheet
       <\/a>
       <form method="POST" action="/admin/events/${escHtml(adminToken)}/duplicate" class="inline">
@@ -1672,9 +1672,9 @@ ${followUpModal}
     <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
       <h2 class="font-semibold text-gray-900">Guests <span class="text-gray-400 font-normal">(${totalGuests})<\/span><\/h2>
       <div class="flex gap-2 flex-wrap">
-        <a href="/admin/events/${escHtml(adminToken)}/signin-sheet.xls"
+        <a href="/admin/events/${escHtml(adminToken)}/signin-sheet" target="_blank"
           class="inline-flex items-center gap-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors"
-          title="Download sign-in sheet (Excel)">
+          title="Open sign-in sheet">
           &#128196; Sign-In Sheet
         <\/a>
         <a href="/admin/events/${escHtml(adminToken)}/export.csv"
@@ -2403,6 +2403,10 @@ ${followUpModal}
       <h2 class="font-semibold text-gray-900">Guests <span class="text-gray-400 font-normal">(${guestCount})<\/span><\/h2>
       <div class="flex gap-2">
         <button onclick="openAddGuest()" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">+ Add Guest<\/button>
+        <a href="/admin/events/${escHtml(adminToken)}/signin-sheet" target="_blank"
+          class="inline-flex items-center gap-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
+          &#128196; Sign-In Sheet
+        <\/a>
         <a href="/agent/${escHtml(adminToken)}/export.csv"
           class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
           &#11015; Export CSV
@@ -2906,10 +2910,10 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// Admin: generate sign-in sheet (XLS / HTML-as-Excel)
+// Admin: generate sign-in sheet (printable HTML page)
 // ---------------------------------------------------------------------------
 
-app.get('/admin/events/:adminToken/signin-sheet.xls', async (c) => {
+app.get('/admin/events/:adminToken/signin-sheet', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
     'SELECT * FROM events WHERE admin_token = ?'
@@ -2925,13 +2929,11 @@ app.get('/admin/events/:adminToken/signin-sheet.xls', async (c) => {
   const dateTime = formatSignInSheetDateTime(event);
 
   const html = buildSignInSheetHtml(event.property_address, dateTime, event.agent_name, qrUrl);
-  const safeTitle = event.property_address.replace(/[^a-z0-9]/gi, '-').toLowerCase().slice(0, 60);
-  const filename = `open-house-signin-${safeTitle}.xls`;
 
   return new Response(html, {
     headers: {
-      'Content-Type': 'application/vnd.ms-excel',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Type': 'text/html; charset=UTF-8',
+      'Cache-Control': 'no-store',
     },
   });
 });
@@ -2989,48 +2991,45 @@ function buildSignInSheetHtml(
     <td style="${dataCellStyle}"></td>
   </tr>`).join('\n');
 
-  return `<html xmlns:o="urn:schemas-microsoft-com:office:office"
- xmlns:x="urn:schemas-microsoft-com:office:excel"
- xmlns="http://www.w3.org/TR/REC-html40">
+  return `<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-<!--[if gte mso 9]><xml>
- <x:ExcelWorkbook>
-  <x:ExcelWorksheets>
-   <x:ExcelWorksheet>
-    <x:Name>Sign-In Sheet</x:Name>
-    <x:WorksheetOptions>
-     <x:Print>
-      <x:ValidPrinterInfo/>
-      <x:PaperSizeIndex>1</x:PaperSizeIndex>
-      <x:Landscape/>
-      <x:HorizontalResolution>600</x:HorizontalResolution>
-      <x:VerticalResolution>600</x:VerticalResolution>
-     </x:Print>
-    </x:WorksheetOptions>
-   </x:ExcelWorksheet>
-  </x:ExcelWorksheets>
- </x:ExcelWorkbook>
-</xml><![endif]-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Open House Sign-In Sheet</title>
 <style>
-  table { border-collapse: collapse; }
+  @page { size: landscape; margin: 0.5in; }
+  * { box-sizing: border-box; }
+  body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #fff; }
+  table { border-collapse: collapse; width: 100%; }
   td { vertical-align: middle; }
-  br { mso-data-placement: same-cell; }
+  .no-print { display: block; text-align: center; margin-bottom: 16px; }
+  .print-btn {
+    background: #4f46e5; color: #fff; border: none; padding: 10px 28px;
+    font-size: 15px; border-radius: 8px; cursor: pointer; font-family: Arial, sans-serif;
+  }
+  .print-btn:hover { background: #4338ca; }
+  @media print {
+    .no-print { display: none !important; }
+    body { padding: 0; }
+  }
 </style>
 </head>
 <body>
-<table cellspacing="0" cellpadding="0"
-  style="border-collapse:collapse;width:750pt;font-family:Arial,sans-serif;">
+<div class="no-print">
+  <button class="print-btn" onclick="window.print()">&#128438; Print Sign-In Sheet</button>
+</div>
+<table cellspacing="0" cellpadding="0">
   <colgroup>
-    <col style="width:185pt">
-    <col style="width:130pt">
-    <col style="width:185pt">
-    <col style="width:250pt">
+    <col style="width:23%">
+    <col style="width:14%">
+    <col style="width:22%">
+    <col style="width:39%">
   </colgroup>
   <!-- Company logo row -->
   <tr>
-    <td colspan="4" style="text-align:center;border:none;padding:14px 4px 6px;">
-      <img src="${COMPANY_LOGO}" height="90" alt="Company Logo" />
+    <td colspan="4" style="text-align:center;border:none;padding:10px 4px 6px;">
+      <img src="${COMPANY_LOGO}" height="80" alt="Company Logo" />
     </td>
   </tr>
   <!-- Sheet title row -->
