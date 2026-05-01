@@ -1155,7 +1155,7 @@ ${adminNav(`<a href="/admin/events/new" class="inline-flex items-center gap-1 bg
              dayEvents.forEach(e => {
                const colors = {happening_now:'bg-green-100 text-green-800',scheduled:'bg-blue-100 text-blue-800',ended:'bg-gray-100 text-gray-600',cancelled:'bg-red-100 text-red-700',achieved:'bg-purple-100 text-purple-700'};
                const cls = colors[e.status] || 'bg-gray-100 text-gray-600';
-               html += '<a href="' + e.url + '" class="block text-xs px-1 py-0.5 rounded mb-0.5 truncate ' + cls + '" title="' + e.title.replace(/"/g,\\"&quot;\\") + '">' + e.title.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '<\/a>';
+               html += '<a href="' + e.url + '" class="block text-xs px-1 py-0.5 rounded mb-0.5 truncate ' + cls + '" title="' + e.title.replace(/"/g,'&quot;') + '">' + e.title.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '<\/a>';
              });
              html += '<\/div>';
            }
