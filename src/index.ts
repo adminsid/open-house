@@ -114,7 +114,7 @@ async function deleteR2FileIfUnreferenced(c: any, key: string | null | undefined
       'SELECT COUNT(*) as count FROM events WHERE photo_key = ? OR agent_photo_key = ? OR agent_photo_2_key = ? OR flyer_key = ?'
     )
       .bind(key, key, key, key)
-      .first<{ count: number }>();
+      .first() as any;
 
     if (check && check.count <= 1) {
       await c.env.BUCKET.delete(key);
@@ -1403,6 +1403,7 @@ app.get('/admin/storage', async (c) => {
         <td class="px-4 py-3">
           <div class="flex items-center gap-2">
             <a href="/api/photo/${encodeURIComponent(key)}" target="_blank" download class="bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-2 py-1 rounded border border-gray-200">Download</a>
+            <button type="button" onclick="renameFile('${escAttr(key)}')" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded border border-indigo-200">Rename</button>
             <form method="POST" action="/admin/storage/delete" class="inline" onsubmit="return confirm('Delete this file? This will clear references in any events.')">
               <input type="hidden" name="key" value="${escAttr(key)}" />
               <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-2 py-1 rounded border border-red-200">Delete</button>
@@ -1528,6 +1529,30 @@ app.get('/admin/storage', async (c) => {
 
         selectAllFiles(false);
       }
+
+      function renameFile(oldKey) {
+        const newKey = prompt('Enter new filename / path:', oldKey);
+        if (newKey && newKey.trim() !== '' && newKey !== oldKey) {
+          const form = document.createElement('form');
+          form.method = 'POST';
+          form.action = '/admin/storage/rename';
+          
+          const inputOld = document.createElement('input');
+          inputOld.type = 'hidden';
+          inputOld.name = 'oldKey';
+          inputOld.value = oldKey;
+          
+          const inputNew = document.createElement('input');
+          inputNew.type = 'hidden';
+          inputNew.name = 'newKey';
+          inputNew.value = newKey.trim();
+          
+          form.appendChild(inputOld);
+          form.appendChild(inputNew);
+          document.body.appendChild(form);
+          form.submit();
+        }
+      }
     </script>
   `;
 
@@ -1571,6 +1596,72 @@ app.post('/admin/storage/bulk-delete', async (c) => {
     }
   }
   return c.redirect('/admin/storage');
+});
+
+// ---------------------------------------------------------------------------
+// Admin: rename storage file
+// ---------------------------------------------------------------------------
+
+app.post('/admin/storage/rename', async (c) => {
+  const form = await c.req.formData();
+  const oldKey = form.get('oldKey') as string | null;
+  const newKey = form.get('newKey') as string | null;
+  
+  if (oldKey && newKey && oldKey !== newKey) {
+    try {
+      const oldObj = await c.env.BUCKET.get(oldKey);
+      if (!oldObj) {
+        return c.text('Source file not found', 404);
+      }
+      
+      await c.env.BUCKET.put(newKey, oldObj.body, {
+        httpMetadata: oldObj.httpMetadata,
+        customMetadata: oldObj.customMetadata
+      });
+      
+      await c.env.BUCKET.delete(oldKey);
+
+      await c.env.DB.prepare('UPDATE events SET photo_key = ? WHERE photo_key = ?').bind(newKey, oldKey).run();
+      await c.env.DB.prepare('UPDATE events SET agent_photo_key = ? WHERE agent_photo_key = ?').bind(newKey, oldKey).run();
+      await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = ? WHERE agent_photo_2_key = ?').bind(newKey, oldKey).run();
+      await c.env.DB.prepare('UPDATE events SET flyer_key = ? WHERE flyer_key = ?').bind(newKey, oldKey).run();
+      
+    } catch (err: any) {
+      console.error('Rename error:', err);
+      return c.text(`Rename failed: ${err.message}`, 500);
+    }
+  }
+  return c.redirect('/admin/storage');
+});
+
+// ---------------------------------------------------------------------------
+// Admin: list storage files by prefix
+// ---------------------------------------------------------------------------
+
+app.get('/admin/storage/list', async (c) => {
+  const prefix = c.req.query('prefix') || '';
+  try {
+    let cursor: string | undefined = undefined;
+    const objects: any[] = [];
+    
+    do {
+      const list: any = await c.env.BUCKET.list({ prefix, cursor });
+      objects.push(...list.objects);
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+
+    objects.sort((a, b) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime());
+
+    const files = objects.map(o => ({
+      key: o.key,
+      sizeFormatted: formatBytes(o.size),
+      uploaded: o.uploaded
+    }));
+
+    return c.json({ success: true, files });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message }, 500);
+  }
 });
 
 function buildTabBar(activeFilter: string, counts: Record<string, number>, view: string): string {
@@ -1963,7 +2054,10 @@ ${followUpModal}
         ${photoUrl ? `<div class="mb-3 rounded-lg overflow-hidden"><img src="${escAttr(photoUrl)}" alt="Property" class="w-full h-40 object-cover" \/><\/div>` : '<p class="text-sm text-gray-400 mb-3">No photo uploaded yet.<\/p>'}
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/photo" enctype="multipart/form-data" class="space-y-2">
           <input type="file" name="photo" accept="image\/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" \/>
-          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">Upload Photo<\/button>
+          <div class="flex gap-2">
+            <button type="submit" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">Upload Photo<\/button>
+            <button type="button" onclick="openSelectFileModal('events/', '/admin/events/${escHtml(adminToken)}/photo', 'Select Property Photo')" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold py-1.5 rounded-lg border border-indigo-200 transition-colors">Select Existing<\/button>
+          </div>
         </form>
       </div>
 
@@ -1982,27 +2076,42 @@ ${followUpModal}
           : '<p class="text-sm text-gray-400 mb-3">No agent 1 photo yet.</p>'}
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo" enctype="multipart/form-data" class="space-y-2">
           <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
-          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhotoUrl ? 'Replace Photo' : 'Upload Photo'}</button>
+          <div class="flex gap-2">
+            <button type="submit" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhotoUrl ? 'Replace Photo' : 'Upload Photo'}</button>
+            <button type="button" onclick="openSelectFileModal('agents/', '/admin/events/${escHtml(adminToken)}/agent-photo', 'Select Agent 1 Photo')" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold py-1.5 rounded-lg border border-indigo-200 transition-colors">Select Existing</button>
+          </div>
         </form>
       </div>
 
       <div class="bg-white rounded-xl shadow p-5">
-        <h2 class="font-semibold text-gray-900 mb-3">Agent 2 Photo / Headshot</h2>
-        ${agentPhoto2Url
-          ? `<div class="mb-3 flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
-               <div class="flex items-center gap-3">
-                 <img src="${escAttr(agentPhoto2Url)}" alt="Agent 2" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" />
-                 <span class="text-xs text-gray-500">Current headshot</span>
-               </div>
-               <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2/delete" class="inline">
-                 <button type="submit" onclick="return confirm('Remove Agent 2 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1.5 rounded-lg border border-red-200 font-medium transition-colors">Remove</button>
-               </form>
-             </div>`
-          : '<p class="text-sm text-gray-400 mb-3">No agent 2 photo yet.</p>'}
-        <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2" enctype="multipart/form-data" class="space-y-2">
-          <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
-          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhoto2Url ? 'Replace Photo' : 'Upload Photo'}</button>
-        </form>
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold text-gray-900">Agent 2 Photo / Headshot</h2>
+          <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+            <input type="checkbox" id="toggle-agent-2" onchange="toggleAgent2(this.checked)" class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" ${agentPhoto2Url ? 'checked' : ''} />
+            <span class="text-xs font-medium text-gray-600">Add Second Agent</span>
+          </label>
+        </div>
+
+        <div id="agent-2-container" class="${agentPhoto2Url ? '' : 'hidden'} space-y-3">
+          ${agentPhoto2Url
+            ? `<div class="mb-3 flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
+                 <div class="flex items-center gap-3">
+                   <img src="${escAttr(agentPhoto2Url)}" alt="Agent 2" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" />
+                   <span class="text-xs text-gray-500">Current headshot</span>
+                 </div>
+                 <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2/delete" class="inline">
+                   <button type="submit" onclick="return confirm('Remove Agent 2 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1.5 rounded-lg border border-red-200 font-medium transition-colors">Remove</button>
+                 </form>
+               </div>`
+            : '<p class="text-sm text-gray-400 mb-3">No agent 2 photo yet.</p>'}
+          <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2" enctype="multipart/form-data" class="space-y-2">
+            <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
+            <div class="flex gap-2">
+              <button type="submit" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhoto2Url ? 'Replace Photo' : 'Upload Photo'}</button>
+              <button type="button" onclick="openSelectFileModal('agents/', '/admin/events/${escHtml(adminToken)}/agent-photo-2', 'Select Agent 2 Photo')" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold py-1.5 rounded-lg border border-indigo-200 transition-colors">Select Existing</button>
+            </div>
+          </form>
+        </div>
       </div>
 
       <div class="bg-white rounded-xl shadow p-5 border-l-4 border-amber-400">
@@ -2025,7 +2134,10 @@ ${followUpModal}
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/flyer" enctype="multipart/form-data" class="space-y-2">
           <input type="file" name="flyer" accept="image\/*,.pdf"
             class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-amber-50 file:text-amber-700 hover:file:bg-amber-100" \/>
-          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${flyerUrl ? 'Replace Flyer' : 'Upload Flyer'}<\/button>
+          <div class="flex gap-2">
+            <button type="submit" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${flyerUrl ? 'Replace Flyer' : 'Upload Flyer'}<\/button>
+            <button type="button" onclick="openSelectFileModal('flyers/', '/admin/events/${escHtml(adminToken)}/flyer', 'Select Flyer')" class="flex-1 bg-amber-50 hover:bg-amber-100 text-amber-700 text-xs font-semibold py-1.5 rounded-lg border border-amber-200 transition-colors">Select Existing</button>
+          </div>
         <\/form>
       <\/div>
     <\/div>
@@ -2131,9 +2243,129 @@ ${followUpModal}
     <\/div>
   <\/div>
 <\/div>
+
+<!-- Select Existing File Modal -->
+<div id="select-file-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+  <div class="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md mx-4 flex flex-col max-h-[80vh]">
+    <div class="flex items-center justify-between mb-4">
+      <h3 id="select-file-title" class="text-lg font-semibold text-gray-900">Select Existing File<\/h3>
+      <button type="button" onclick="closeSelectFileModal()" class="text-gray-400 hover:text-gray-600 text-xl font-bold">&times;<\/button>
+    <\/div>
+    <div class="mb-4">
+      <input type="text" id="select-file-search" placeholder="Search by filename..." oninput="filterModalFiles()" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
+    <\/div>
+    <div id="select-file-list" class="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[200px]">
+      <div class="text-center py-8 text-gray-400 text-sm">Loading files...<\/div>
+    <\/div>
+    <div class="flex justify-end gap-3 pt-4 border-t border-gray-100 mt-4">
+      <button type="button" onclick="closeSelectFileModal()" class="text-gray-600 px-4 py-2 rounded-lg border hover:bg-gray-50 text-sm">Cancel<\/button>
+    <\/div>
+  <\/div>
+<\/div>
+
 <script>
 function copyText(id) {
   navigator.clipboard.writeText(document.getElementById(id).value).then(() => alert('Copied!'));
+}
+
+let currentPrefix = '';
+let currentTargetUrl = '';
+let modalFiles = [];
+
+function openSelectFileModal(prefix, targetUrl, title) {
+  currentPrefix = prefix;
+  currentTargetUrl = targetUrl;
+  document.getElementById('select-file-title').innerText = title;
+  document.getElementById('select-file-search').value = '';
+  document.getElementById('select-file-modal').classList.remove('hidden');
+  document.getElementById('select-file-list').innerHTML = '<div class="text-center py-8 text-gray-400 text-sm">Loading files...<\/div>';
+  
+  fetch('/admin/storage/list?prefix=' + encodeURIComponent(prefix))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.success) {
+        modalFiles = data.files;
+        renderModalFiles();
+      } else {
+        document.getElementById('select-file-list').innerHTML = '<div class="text-center py-8 text-red-500 text-sm">Failed to load files<\/div>';
+      }
+    })
+    .catch(function(err) {
+      document.getElementById('select-file-list').innerHTML = '<div class="text-center py-8 text-red-500 text-sm">Error loading files<\/div>';
+    });
+}
+
+function renderModalFiles() {
+  const q = document.getElementById('select-file-search').value.toLowerCase().trim();
+  const filtered = modalFiles.filter(function(f) {
+    return !q || f.key.toLowerCase().indexOf(q) !== -1;
+  });
+  
+  if (filtered.length === 0) {
+    document.getElementById('select-file-list').innerHTML = '<div class="text-center py-8 text-gray-400 text-sm">No files found.<\/div>';
+    return;
+  }
+  
+  const isImage = currentPrefix.indexOf('events/') === 0 || currentPrefix.indexOf('agents/') === 0;
+  let html = '';
+  for (let i = 0; i < filtered.length; i++) {
+    const f = filtered[i];
+    const parts = f.key.split('/');
+    const filename = parts[parts.length - 1];
+    const previewUrl = isImage ? '/api/photo/' + encodeURIComponent(f.key) : '';
+    
+    let leftHtml = '';
+    if (isImage) {
+      leftHtml = '<img src="' + previewUrl + '" class="w-10 h-10 object-cover rounded-lg border border-gray-200" \/>';
+    } else {
+      leftHtml = '<div class="w-10 h-10 flex items-center justify-center bg-amber-50 text-amber-600 rounded-lg text-lg">&#128196;<\/div>';
+    }
+    
+    html += '<div class="flex items-center justify-between gap-3 p-3 bg-gray-50 hover:bg-gray-100 rounded-xl border border-gray-100 transition-colors">' +
+              '<div class="flex items-center gap-3 min-w-0">' +
+                leftHtml +
+                '<div class="min-w-0">' +
+                  '<p class="text-xs font-semibold text-gray-700 truncate" title="' + f.key + '">' + filename + '<\/p>' +
+                  '<p class="text-[10px] text-gray-400 truncate">' + f.key + ' &bull; ' + f.sizeFormatted + '<\/p>' +
+                '<\/div>' +
+              '<\/div>' +
+              '<button type="button" onclick="selectModalFile(\'' + f.key.replace(/'/g, "\\'") + '\')" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors">Select<\/button>' +
+            '<\/div>';
+  }
+  
+  document.getElementById('select-file-list').innerHTML = html;
+}
+
+function filterModalFiles() {
+  renderModalFiles();
+}
+
+function selectModalFile(key) {
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = currentTargetUrl;
+  
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.name = 'existing_key';
+  input.value = key;
+  
+  form.appendChild(input);
+  document.body.appendChild(form);
+  form.submit();
+}
+
+function closeSelectFileModal() {
+  document.getElementById('select-file-modal').classList.add('hidden');
+}
+
+function toggleAgent2(checked) {
+  const container = document.getElementById('agent-2-container');
+  if (checked) {
+    container.classList.remove('hidden');
+  } else {
+    container.classList.add('hidden');
+  }
 }
 <\/script>`;
 
@@ -2202,6 +2434,20 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
+  const existingKey = form.get('existing_key') as string | null;
+
+  if (existingKey) {
+    if (event.photo_key && event.photo_key !== existingKey) {
+      await deleteR2FileIfUnreferenced(c, event.photo_key);
+    }
+    await c.env.DB.prepare(
+      'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken)
+      .run();
+    return c.redirect(`/admin/events/${adminToken}`);
+  }
+
   const file = form.get('photo') as File | null;
 
   if (!file || file.size === 0) {
@@ -2243,6 +2489,20 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
+  const existingKey = form.get('existing_key') as string | null;
+
+  if (existingKey) {
+    if (event.agent_photo_key && event.agent_photo_key !== existingKey) {
+      await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
+    }
+    await c.env.DB.prepare(
+      'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken)
+      .run();
+    return c.redirect(`/admin/events/${adminToken}`);
+  }
+
   const file = form.get('photo') as File | null;
 
   if (!file || file.size === 0) {
@@ -2284,6 +2544,20 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
+  const existingKey = form.get('existing_key') as string | null;
+
+  if (existingKey) {
+    if (event.agent_photo_2_key && event.agent_photo_2_key !== existingKey) {
+      await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
+    }
+    await c.env.DB.prepare(
+      'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken)
+      .run();
+    return c.redirect(`/admin/events/${adminToken}`);
+  }
+
   const file = form.get('photo') as File | null;
 
   if (!file || file.size === 0) {
@@ -2375,6 +2649,20 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
+  const existingKey = form.get('existing_key') as string | null;
+
+  if (existingKey) {
+    if (event.flyer_key && event.flyer_key !== existingKey) {
+      await deleteR2FileIfUnreferenced(c, event.flyer_key);
+    }
+    await c.env.DB.prepare(
+      'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken)
+      .run();
+    return c.redirect(`/admin/events/${adminToken}`);
+  }
+
   const file = form.get('flyer') as File | null;
 
   if (!file || file.size === 0) {
