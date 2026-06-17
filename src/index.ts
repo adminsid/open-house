@@ -30,6 +30,7 @@ type Event = {
   agent_phone: string | null;
   company_name: string | null;
   agent_photo_key: string | null;
+  agent_photo_2_key: string | null;
   description: string | null;
   start_time: string;
   end_time: string;
@@ -104,6 +105,31 @@ function getEventStatus(event: Event, now: Date): string {
   if (now < start) return 'scheduled';
   if (now >= start && now <= end) return 'happening_now';
   return 'ended';
+}
+
+async function deleteR2FileIfUnreferenced(c: any, key: string | null | undefined): Promise<void> {
+  if (!key) return;
+  try {
+    const check = await c.env.DB.prepare(
+      'SELECT COUNT(*) as count FROM events WHERE photo_key = ? OR agent_photo_key = ? OR agent_photo_2_key = ? OR flyer_key = ?'
+    )
+      .bind(key, key, key, key)
+      .first<{ count: number }>();
+
+    if (check && check.count <= 1) {
+      await c.env.BUCKET.delete(key);
+    }
+  } catch (err) {
+    console.error(`Error in deleteR2FileIfUnreferenced for key ${key}:`, err);
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 function statusBadge(status: string): string {
@@ -275,6 +301,61 @@ function adminNav(extra = ''): string {
       </div>
     </div>
   </nav>`;
+}
+
+function adminFooterHtml(): string {
+  return `
+<div class="mt-12 border-t border-gray-100 bg-white py-6">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
+    <div class="flex items-center gap-2 text-xs text-gray-400">
+      ${equalHousingLogo('w-5 h-5 text-gray-300')}
+      <span>&copy; ${new Date().getFullYear()} Prime America Real Estate, Inc. All rights reserved.</span>
+    </div>
+    <div id="storage-footer-loading" class="flex items-center gap-3 text-xs text-gray-500 font-medium">
+      <span>Storage: Loading...</span>
+    </div>
+    <div id="storage-footer" class="hidden flex items-center gap-3 text-xs text-gray-500 font-medium">
+      <div class="flex items-center gap-1.5">
+        <span>Storage:</span>
+        <span id="storage-used" class="font-bold text-gray-700">0 MB</span>
+        <span class="text-gray-300">/</span>
+        <span class="text-gray-400">20 GB</span>
+      </div>
+      <div class="w-24 bg-gray-100 rounded-full h-2 overflow-hidden border border-gray-200">
+        <div id="storage-bar" class="bg-indigo-600 h-full rounded-full" style="width: 0%"></div>
+      </div>
+      <span id="storage-pct" class="text-gray-400">0%</span>
+      <a href="/admin/storage" class="text-indigo-600 hover:text-indigo-800 hover:underline border-l border-gray-200 pl-3">Manage Storage &rarr;</a>
+    </div>
+  </div>
+</div>
+<script>
+(function() {
+  function checkStorage() {
+    fetch('/admin/storage/info')
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          const usedSpan = document.getElementById('storage-used');
+          const barDiv = document.getElementById('storage-bar');
+          const pctSpan = document.getElementById('storage-pct');
+          const loadingDiv = document.getElementById('storage-footer-loading');
+          const footerDiv = document.getElementById('storage-footer');
+          if (usedSpan) usedSpan.textContent = data.formattedSize;
+          if (barDiv) barDiv.style.width = data.percentage + '%';
+          if (pctSpan) pctSpan.textContent = data.percentage + '%';
+          if (loadingDiv) loadingDiv.classList.add('hidden');
+          if (footerDiv) footerDiv.classList.remove('hidden');
+        }
+      })
+      .catch(err => {
+        console.error('Failed to load storage info:', err);
+      });
+  }
+  checkStorage();
+})();
+</script>
+  `;
 }
 
 function agentNav(agentName: string, companyName: string | null, extra = ''): string {
@@ -560,6 +641,9 @@ app.get('/e/:token', async (c) => {
   const agentPhotoUrl = event.agent_photo_key
     ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
     : null;
+  const agentPhoto2Url = event.agent_photo_2_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_2_key)}`
+    : null;
   const initials = event.agent_name
     .split(' ')
     .map((p) => p[0] ?? '')
@@ -577,10 +661,13 @@ app.get('/e/:token', async (c) => {
   <div class="hero-overlay absolute inset-0"><\/div>
   <div class="absolute bottom-0 left-0 right-0 px-5 pb-5">
     <div class="max-w-lg mx-auto flex items-end gap-4">
-      <div class="flex-shrink-0">
+      <div class="flex-shrink-0 flex items-center gap-1.5">
         ${agentPhotoUrl
           ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover shadow-xl" style="border-color:var(--gold)" \/>`
           : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold shadow-xl" style="border-color:var(--gold);background:rgba(201,168,76,0.25);color:var(--gold)">${escHtml(initials)}<\/div>`}
+        ${agentPhoto2Url
+          ? `<img src="${escAttr(agentPhoto2Url)}" alt="Co-Agent" class="w-14 h-14 rounded-full border-2 object-cover shadow-xl" style="border-color:var(--gold)" \/>`
+          : ''}
       <\/div>
       <div class="min-w-0 flex-1">
         ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest mb-0.5" style="color:var(--gold)">${escHtml(event.company_name)}<\/p>` : ''}
@@ -790,10 +877,10 @@ app.post('/e/:token/signin', async (c) => {
 app.get('/e/:token/success', async (c) => {
   const token = c.req.param('token');
   const event = await c.env.DB.prepare(
-    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, photo_key FROM events WHERE public_token = ?'
+    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key FROM events WHERE public_token = ?'
   )
     .bind(token)
-    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'photo_key'>>();
+    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'agent_photo_2_key' | 'photo_key'>>();
 
   const title = event?.title ?? 'Open House';
   const photoUrl = event?.photo_key
@@ -801,6 +888,9 @@ app.get('/e/:token/success', async (c) => {
     : null;
   const agentPhotoUrl = event?.agent_photo_key
     ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
+    : null;
+  const agentPhoto2Url = event?.agent_photo_2_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_2_key)}`
     : null;
   const initials = (event?.agent_name ?? '??')
     .split(' ')
@@ -825,10 +915,13 @@ app.get('/e/:token/success', async (c) => {
       <div class="divider mb-6"><\/div>
       ${event
         ? `<div class="flex items-center justify-center gap-4">
-             <div class="flex-shrink-0">
+             <div class="flex-shrink-0 flex items-center gap-1.5">
                ${agentPhotoUrl
                  ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover" style="border-color:var(--gold)" \/>`
                  : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold" style="border-color:var(--gold);background:rgba(201,168,76,0.1);color:var(--gold)">${escHtml(initials)}<\/div>`}
+               ${agentPhoto2Url
+                 ? `<img src="${escAttr(agentPhoto2Url)}" alt="Co-Agent" class="w-14 h-14 rounded-full border-2 object-cover" style="border-color:var(--gold)" \/>`
+                 : ''}
              <\/div>
              <div class="text-left">
                ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest" style="color:var(--gold)">${escHtml(event.company_name)}<\/p>` : ''}
@@ -945,7 +1038,7 @@ function filterEvents(q) {
 }
 <\/script>`;
 
-    return c.html(pageShell('Admin Dashboard', body));
+    return c.html(pageShell('Admin Dashboard', body + adminFooterHtml()));
   }
 
   // Normal tabs: exclude soft-deleted events
@@ -1183,9 +1276,301 @@ function filterEvents(q) {
   const noResults = document.getElementById('no-results');
   if (noResults) noResults.classList.toggle('hidden', visible > 0);
 }
-<\/script>`;
+</script>`;
+  return c.html(pageShell('Admin Dashboard', body + adminFooterHtml()));
+});
 
-  return c.html(pageShell('Admin Dashboard', body));
+// ---------------------------------------------------------------------------
+// Admin: Storage Management API & Pages
+// ---------------------------------------------------------------------------
+
+app.get('/admin/storage/info', async (c) => {
+  try {
+    let totalSize = 0;
+    let fileCount = 0;
+    let cursor: string | undefined = undefined;
+    
+    do {
+      const list: any = await c.env.BUCKET.list({ cursor });
+      fileCount += list.objects.length;
+      for (const obj of list.objects) {
+        totalSize += obj.size;
+      }
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+
+    const limitBytes = 20 * 1024 * 1024 * 1024; // 20 GB
+    const percentage = (totalSize / limitBytes) * 100;
+
+    return c.json({
+      success: true,
+      totalSizeBytes: totalSize,
+      fileCount,
+      formattedSize: formatBytes(totalSize),
+      formattedLimit: '20 GB',
+      percentage: Math.min(100, parseFloat(percentage.toFixed(2))),
+    });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message }, 500);
+  }
+});
+
+app.get('/admin/storage', async (c) => {
+  let totalSize = 0;
+  let cursor: string | undefined = undefined;
+  const objects: any[] = [];
+  try {
+    do {
+      const list: any = await c.env.BUCKET.list({ cursor });
+      objects.push(...list.objects);
+      for (const obj of list.objects) {
+        totalSize += obj.size;
+      }
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+  } catch (err) {
+    console.error('R2 list error:', err);
+  }
+
+  const limitBytes = 20 * 1024 * 1024 * 1024; // 20 GB
+  const percentage = Math.min(100, (totalSize / limitBytes) * 100);
+
+  const events = await c.env.DB.prepare(
+    'SELECT id, title, admin_token, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events'
+  ).all<Event>();
+  
+  const refMap = new Map<string, { eventTitle: string; role: string; adminToken: string }>();
+  for (const ev of events.results ?? []) {
+    if (ev.photo_key) {
+      refMap.set(ev.photo_key, { eventTitle: ev.title, role: 'Property Photo', adminToken: ev.admin_token });
+    }
+    if (ev.agent_photo_key) {
+      refMap.set(ev.agent_photo_key, { eventTitle: ev.title, role: 'Agent Photo 1', adminToken: ev.admin_token });
+    }
+    if (ev.agent_photo_2_key) {
+      refMap.set(ev.agent_photo_2_key, { eventTitle: ev.title, role: 'Agent Photo 2', adminToken: ev.admin_token });
+    }
+    if (ev.flyer_key) {
+      refMap.set(ev.flyer_key, { eventTitle: ev.title, role: 'Flyer', adminToken: ev.admin_token });
+    }
+  }
+
+  const rows = objects.map((obj) => {
+    const key = obj.key;
+    const ref = refMap.get(key);
+    const sizeFormatted = formatBytes(obj.size);
+    const dateFormatted = new Date(obj.uploaded).toLocaleString('en-US', { timeZone: 'America/New_York' });
+    
+    let previewHtml = '';
+    const ext = key.split('.').pop()?.toLowerCase();
+    if (ext === 'pdf') {
+      previewHtml = `<span class="text-xl" title="PDF Document">📄</span>`;
+    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext ?? '')) {
+      previewHtml = `<img src="/api/photo/${encodeURIComponent(key)}" class="w-10 h-10 object-cover rounded border border-gray-100" alt="Preview" />`;
+    } else {
+      previewHtml = `<span class="text-xl" title="File">📁</span>`;
+    }
+
+    let assocHtml = '';
+    let searchAssoc = 'orphaned unreferenced';
+    if (ref) {
+      searchAssoc = `${ref.eventTitle} ${ref.role}`.toLowerCase();
+      assocHtml = `
+        <div class="text-sm font-medium text-gray-900">${escHtml(ref.eventTitle)}</div>
+        <div class="text-xs text-indigo-600 font-semibold uppercase tracking-wider">${ref.role}</div>
+        <a href="/admin/events/${escHtml(ref.adminToken)}" class="text-xs text-indigo-500 hover:underline">View Event &rarr;</a>
+      `;
+    } else {
+      assocHtml = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-800">Orphaned (Unreferenced)</span>`;
+    }
+
+    const searchData = (key + ' ' + searchAssoc).toLowerCase();
+
+    return `
+      <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0" data-search="${escAttr(searchData)}">
+        <td class="px-4 py-3 text-center">
+          <input type="checkbox" value="${escAttr(key)}" class="file-checkbox rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" onchange="updateBulkDeleteBtn()" />
+        </td>
+        <td class="px-4 py-3 text-center">
+          <div class="flex items-center justify-center">${previewHtml}</div>
+        </td>
+        <td class="px-4 py-3">
+          <div class="text-sm font-mono text-gray-700 break-all select-all" title="${escAttr(key)}">${escHtml(key)}</div>
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">${sizeFormatted}</td>
+        <td class="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">${dateFormatted}</td>
+        <td class="px-4 py-3">${assocHtml}</td>
+        <td class="px-4 py-3">
+          <div class="flex items-center gap-2">
+            <a href="/api/photo/${encodeURIComponent(key)}" target="_blank" download class="bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-2 py-1 rounded border border-gray-200">Download</a>
+            <form method="POST" action="/admin/storage/delete" class="inline" onsubmit="return confirm('Delete this file? This will clear references in any events.')">
+              <input type="hidden" name="key" value="${escAttr(key)}" />
+              <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-2 py-1 rounded border border-red-200">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  const body = `
+    ${adminNav()}
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+      
+      <div class="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <a href="/admin" class="text-sm text-indigo-600 hover:underline">&larr; Back to Events</a>
+          <h1 class="text-2xl font-bold text-gray-900 mt-1">Cloudflare Storage Manager</h1>
+        </div>
+        <div class="text-sm text-gray-500">${objects.length} file(s) stored</div>
+      </div>
+
+      <!-- Storage progress card -->
+      <div class="bg-white rounded-xl shadow p-6 border border-gray-100">
+        <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">R2 Bucket Space Used</h2>
+        <div class="flex items-center justify-between text-base font-bold text-gray-900 mb-2">
+          <span>${formatBytes(totalSize)}</span>
+          <span>20 GB</span>
+        </div>
+        <div class="w-full bg-gray-100 rounded-full h-3 overflow-hidden">
+          <div class="bg-indigo-600 h-full rounded-full transition-all duration-500" style="width: ${percentage}%"></div>
+        </div>
+        <p class="text-xs text-gray-400 mt-2">${percentage.toFixed(2)}% of 20 GB limit used</p>
+      </div>
+
+      <!-- Table Card -->
+      <div class="bg-white rounded-xl shadow border border-gray-100 overflow-hidden">
+        <div class="p-4 bg-gray-50 border-b border-gray-100 flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-3 flex-1 min-w-0 sm:max-w-sm">
+            <input type="text" id="storage-search" placeholder="🔍 Search by key or event..." oninput="filterStorage(this.value)"
+              class="w-full rounded-lg border border-gray-300 px-3.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+          </div>
+          
+          <form id="bulk-delete-form" method="POST" action="/admin/storage/bulk-delete" class="inline" onsubmit="return confirm('Delete selected files? This will clear references in any events.')">
+            <input type="hidden" id="bulk-keys" name="keys" />
+            <button id="bulk-delete-btn" type="submit" disabled
+              class="bg-red-50 text-red-400 border border-red-100 text-xs font-semibold px-4 py-2 rounded-lg transition-colors cursor-not-allowed">
+              Bulk Delete (0)
+            </button>
+          </form>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-gray-100">
+            <thead>
+              <tr class="bg-gray-50 text-xs font-semibold text-gray-500 uppercase tracking-wider text-left border-b border-gray-100">
+                <th class="px-4 py-3 text-center w-12">
+                  <input type="checkbox" id="select-all" class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" onchange="selectAllFiles(this.checked)" />
+                </th>
+                <th class="px-4 py-3 text-center w-16">Preview</th>
+                <th class="px-4 py-3">File Key</th>
+                <th class="px-4 py-3">Size</th>
+                <th class="px-4 py-3">Uploaded</th>
+                <th class="px-4 py-3">Referenced By</th>
+                <th class="px-4 py-3">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="storage-tbody" class="divide-y divide-gray-50">
+              ${rows || `<tr><td colspan="7" class="px-4 py-12 text-center text-gray-400 text-sm">No files uploaded to storage yet.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+
+    <script>
+      function selectAllFiles(checked) {
+        const checkboxes = document.querySelectorAll('.file-checkbox');
+        checkboxes.forEach(cb => {
+          const row = cb.closest('tr');
+          if (row && row.style.display !== 'none') {
+            cb.checked = checked;
+          }
+        });
+        updateBulkDeleteBtn();
+      }
+
+      function updateBulkDeleteBtn() {
+        const checkboxes = document.querySelectorAll('.file-checkbox:checked');
+        const btn = document.getElementById('bulk-delete-btn');
+        const keysInput = document.getElementById('bulk-keys');
+        const count = checkboxes.length;
+        
+        btn.textContent = 'Bulk Delete (' + count + ')';
+        if (count > 0) {
+          btn.disabled = false;
+          btn.classList.remove('bg-red-50', 'text-red-400', 'border-red-100', 'cursor-not-allowed');
+          btn.classList.add('bg-red-600', 'text-white', 'hover:bg-red-700', 'shadow-md');
+          
+          const keys = [];
+          checkboxes.forEach(cb => keys.push(cb.value));
+          keysInput.value = JSON.stringify(keys);
+        } else {
+          btn.disabled = true;
+          btn.classList.add('bg-red-50', 'text-red-400', 'border-red-100', 'cursor-not-allowed');
+          btn.classList.remove('bg-red-600', 'text-white', 'hover:bg-red-700', 'shadow-md');
+          keysInput.value = '';
+        }
+      }
+
+      function filterStorage(q) {
+        const term = q.toLowerCase().trim();
+        const rows = document.querySelectorAll('#storage-tbody tr');
+        let visible = 0;
+        
+        rows.forEach(row => {
+          if (!row.dataset.search) return;
+          const match = !term || row.dataset.search.includes(term);
+          row.style.display = match ? '' : 'none';
+          if (match) visible++;
+        });
+
+        selectAllFiles(false);
+      }
+    </script>
+  `;
+
+  return c.html(pageShell('Storage Manager', body));
+});
+
+app.post('/admin/storage/delete', async (c) => {
+  const form = await c.req.formData();
+  const key = form.get('key') as string | null;
+  if (key) {
+    await c.env.BUCKET.delete(key).catch((err: unknown) => {
+      console.error('R2 delete error:', err);
+    });
+
+    await c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key).run();
+    await c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key).run();
+    await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key).run();
+    await c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key).run();
+  }
+  return c.redirect('/admin/storage');
+});
+
+app.post('/admin/storage/bulk-delete', async (c) => {
+  const form = await c.req.formData();
+  const keysStr = form.get('keys') as string | null;
+  if (keysStr) {
+    try {
+      const keys = JSON.parse(keysStr) as string[];
+      for (const key of keys) {
+        await c.env.BUCKET.delete(key).catch((err: unknown) => {
+          console.error('R2 delete error for key ' + key + ':', err);
+        });
+
+        await c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key).run();
+        await c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key).run();
+        await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key).run();
+        await c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key).run();
+      }
+    } catch (err) {
+      console.error('Bulk delete parse error:', err);
+    }
+  }
+  return c.redirect('/admin/storage');
 });
 
 function buildTabBar(activeFilter: string, counts: Record<string, number>, view: string): string {
@@ -1362,6 +1747,9 @@ app.get('/admin/events/:adminToken', async (c) => {
     : null;
   const agentPhotoUrl = event.agent_photo_key
     ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
+    : null;
+  const agentPhoto2Url = event.agent_photo_2_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_2_key)}`
     : null;
   const flyerUrl = event.flyer_key
     ? `/admin/flyer/${encodeURIComponent(event.flyer_key)}`
@@ -1576,19 +1964,46 @@ ${followUpModal}
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/photo" enctype="multipart/form-data" class="space-y-2">
           <input type="file" name="photo" accept="image\/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" \/>
           <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">Upload Photo<\/button>
-        <\/form>
-      <\/div>
+        </form>
+      </div>
 
       <div class="bg-white rounded-xl shadow p-5">
-        <h2 class="font-semibold text-gray-900 mb-3">Agent Photo \/ Headshot<\/h2>
+        <h2 class="font-semibold text-gray-900 mb-3">Agent 1 Photo / Headshot</h2>
         ${agentPhotoUrl
-          ? `<div class="mb-3 flex items-center gap-3"><img src="${escAttr(agentPhotoUrl)}" alt="Agent" class="w-16 h-16 rounded-full object-cover border-2 border-indigo-100" \/><span class="text-sm text-gray-500">Current headshot<\/span><\/div>`
-          : '<p class="text-sm text-gray-400 mb-3">No agent photo yet.<\/p>'}
+          ? `<div class="mb-3 flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
+               <div class="flex items-center gap-3">
+                 <img src="${escAttr(agentPhotoUrl)}" alt="Agent 1" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" />
+                 <span class="text-xs text-gray-500">Current headshot</span>
+               </div>
+               <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo/delete" class="inline">
+                 <button type="submit" onclick="return confirm('Remove Agent 1 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1.5 rounded-lg border border-red-200 font-medium transition-colors">Remove</button>
+               </form>
+             </div>`
+          : '<p class="text-sm text-gray-400 mb-3">No agent 1 photo yet.</p>'}
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo" enctype="multipart/form-data" class="space-y-2">
-          <input type="file" name="photo" accept="image\/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" \/>
-          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">Upload Agent Photo<\/button>
-        <\/form>
-      <\/div>
+          <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
+          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhotoUrl ? 'Replace Photo' : 'Upload Photo'}</button>
+        </form>
+      </div>
+
+      <div class="bg-white rounded-xl shadow p-5">
+        <h2 class="font-semibold text-gray-900 mb-3">Agent 2 Photo / Headshot</h2>
+        ${agentPhoto2Url
+          ? `<div class="mb-3 flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
+               <div class="flex items-center gap-3">
+                 <img src="${escAttr(agentPhoto2Url)}" alt="Agent 2" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" />
+                 <span class="text-xs text-gray-500">Current headshot</span>
+               </div>
+               <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2/delete" class="inline">
+                 <button type="submit" onclick="return confirm('Remove Agent 2 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1.5 rounded-lg border border-red-200 font-medium transition-colors">Remove</button>
+               </form>
+             </div>`
+          : '<p class="text-sm text-gray-400 mb-3">No agent 2 photo yet.</p>'}
+        <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2" enctype="multipart/form-data" class="space-y-2">
+          <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
+          <button type="submit" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhoto2Url ? 'Replace Photo' : 'Upload Photo'}</button>
+        </form>
+      </div>
 
       <div class="bg-white rounded-xl shadow p-5 border-l-4 border-amber-400">
         <h2 class="font-semibold text-gray-900 mb-1">Event Flyer<\/h2>
@@ -1649,13 +2064,22 @@ ${followUpModal}
               <input type="tel" name="phone" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
             <\/div>
           <\/div>
-          <div>
-            <label class="block text-xs font-medium text-gray-600 mb-1">Type<\/label>
-            <select name="is_rsvp" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-              <option value="1">RSVP (pre-registered)<\/option>
-              <option value="0">Walk-in<\/option>
-            <\/select>
-          <\/div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-medium text-gray-600 mb-1">Type</label>
+              <select name="is_rsvp" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option value="1">RSVP (pre-registered)</option>
+                <option value="0">Walk-in</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-gray-600 mb-1">Working with Agent?</label>
+              <select name="is_agent" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <option value="0">No</option>
+                <option value="1">Yes</option>
+              </select>
+            </div>
+          </div>
           <div>
             <label class="block text-xs font-medium text-gray-600 mb-1">Notes<\/label>
             <input type="text" name="notes" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Optional notes&hellip;" \/>
@@ -1699,7 +2123,7 @@ ${followUpModal}
             <th class="px-4 py-3 text-left">Notes<\/th>
             <th class="px-4 py-3 text-left">Actions<\/th>
           <\/tr>
-        <\/thead>
+        </thead>
         <tbody class="divide-y divide-gray-50">
           ${guestRows || `<tr><td colspan="11" class="px-4 py-10 text-center text-gray-400 text-sm">No guests have signed in yet.<\/td><\/tr>`}
         <\/tbody>
@@ -1785,9 +2209,7 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
   }
 
   if (event.photo_key) {
-    await c.env.BUCKET.delete(event.photo_key).catch((err: unknown) => {
-      console.error('R2 delete error:', err);
-    });
+    await deleteR2FileIfUnreferenced(c, event.photo_key);
   }
 
   const ext = file.name.split('.').pop() ?? 'jpg';
@@ -1828,9 +2250,7 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
   }
 
   if (event.agent_photo_key) {
-    await c.env.BUCKET.delete(event.agent_photo_key).catch((err: unknown) => {
-      console.error('R2 delete error:', err);
-    });
+    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
   }
 
   const ext = file.name.split('.').pop() ?? 'jpg';
@@ -1844,6 +2264,97 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
     'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
   )
     .bind(key, new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: upload agent photo 2
+// ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'agent_photo_2_key'>>();
+
+  if (!event) return c.notFound();
+
+  const form = await c.req.formData();
+  const file = form.get('photo') as File | null;
+
+  if (!file || file.size === 0) {
+    return c.redirect(`/admin/events/${adminToken}`);
+  }
+
+  if (event.agent_photo_2_key) {
+    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
+  }
+
+  const ext = file.name.split('.').pop() ?? 'jpg';
+  const key = `agents/${event.id}/${generateId()}_2.${ext}`;
+
+  await c.env.BUCKET.put(key, file.stream(), {
+    httpMetadata: { contentType: file.type || 'image/jpeg' },
+  });
+
+  await c.env.DB.prepare(
+    'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(key, new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: delete agent photos
+// ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/agent-photo/delete', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id, agent_photo_key FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'agent_photo_key'>>();
+
+  if (!event) return c.notFound();
+
+  if (event.agent_photo_key) {
+    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
+  }
+
+  await c.env.DB.prepare(
+    'UPDATE events SET agent_photo_key = NULL, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'agent_photo_2_key'>>();
+
+  if (!event) return c.notFound();
+
+  if (event.agent_photo_2_key) {
+    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
+  }
+
+  await c.env.DB.prepare(
+    'UPDATE events SET agent_photo_2_key = NULL, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(new Date().toISOString(), adminToken)
     .run();
 
   return c.redirect(`/admin/events/${adminToken}`);
@@ -1889,7 +2400,7 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
   }
 
   if (event.flyer_key) {
-    await c.env.BUCKET.delete(event.flyer_key).catch(() => {});
+    await deleteR2FileIfUnreferenced(c, event.flyer_key);
   }
 
   const key = `flyers/${event.id}/${generateId()}.${rawExt}`;
@@ -1922,7 +2433,7 @@ app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
   if (!event) return c.notFound();
 
   if (event.flyer_key) {
-    await c.env.BUCKET.delete(event.flyer_key).catch(() => {});
+    await deleteR2FileIfUnreferenced(c, event.flyer_key);
   }
 
   await c.env.DB.prepare(
@@ -2055,21 +2566,24 @@ app.post('/admin/events/:adminToken/restore', async (c) => {
 app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key, agent_photo_key, flyer_key FROM events WHERE admin_token = ?'
+    'SELECT id, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events WHERE admin_token = ?'
   )
     .bind(adminToken)
-    .first<Pick<Event, 'id' | 'photo_key' | 'agent_photo_key' | 'flyer_key'>>();
+    .first<Pick<Event, 'id' | 'photo_key' | 'agent_photo_key' | 'agent_photo_2_key' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
 
   if (event.photo_key) {
-    await c.env.BUCKET.delete(event.photo_key).catch(() => {});
+    await deleteR2FileIfUnreferenced(c, event.photo_key);
   }
   if (event.agent_photo_key) {
-    await c.env.BUCKET.delete(event.agent_photo_key).catch(() => {});
+    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
+  }
+  if (event.agent_photo_2_key) {
+    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
   }
   if (event.flyer_key) {
-    await c.env.BUCKET.delete(event.flyer_key).catch(() => {});
+    await deleteR2FileIfUnreferenced(c, event.flyer_key);
   }
 
   await c.env.DB.prepare('DELETE FROM events WHERE id = ?').bind(event.id).run();
@@ -2099,9 +2613,9 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
 
   await c.env.DB.prepare(
     `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name,
-       description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key,
+       description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key, agent_photo_2_key, flyer_key,
        status, admin_token, public_token, rsvp_token, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
   )
     .bind(
       newId,
@@ -2117,9 +2631,10 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
       source.end_time,
       source.timezone,
       source.listing_url,
-      // Do not copy R2 photo keys — deleted originals would break the duplicate's images
-      null,
-      null,
+      source.photo_key,
+      source.agent_photo_key,
+      source.agent_photo_2_key,
+      source.flyer_key,
       newAdminToken,
       newPublicToken,
       newRsvpToken,
@@ -2187,6 +2702,9 @@ app.get('/agent/:adminToken', async (c) => {
   const agentPhotoUrl = event.agent_photo_key
     ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
     : null;
+  const agentPhoto2Url = event.agent_photo_2_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_2_key)}`
+    : null;
   const initials = event.agent_name
     .split(' ')
     .map((p) => p[0] ?? '')
@@ -2220,7 +2738,7 @@ app.get('/agent/:adminToken', async (c) => {
           : g.is_rsvp
             ? `<form method="POST" action="/agent/${escHtml(adminToken)}/guests/${escAttr(g.id)}/checkin" class="inline">
                 <button type="submit" class="bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-2 py-1 rounded-lg border border-green-200 transition-colors">Check In<\/button>
-               <\/form>`
+               </form>`
             : '&mdash;'}
       <\/td>
       <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">${formatDateTime(g.signed_in_at, event.timezone)}<\/td>
@@ -2289,13 +2807,22 @@ app.get('/agent/:adminToken', async (c) => {
           <input type="tel" name="phone" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
         <\/div>
       <\/div>
-      <div>
-        <label class="block text-xs font-medium text-gray-600 mb-1">Type<\/label>
-        <select name="is_rsvp" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-          <option value="1">RSVP (pre-registered)<\/option>
-          <option value="0">Walk-in<\/option>
-        <\/select>
-      <\/div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Type</label>
+          <select name="is_rsvp" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            <option value="1">RSVP (pre-registered)</option>
+            <option value="0">Walk-in</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Working with Agent?</label>
+          <select name="is_agent" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            <option value="0">No</option>
+            <option value="1">Yes</option>
+          </select>
+        </div>
+      </div>
       <div>
         <label class="block text-xs font-medium text-gray-600 mb-1">Notes<\/label>
         <input type="text" name="notes" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Optional notes&hellip;" \/>
@@ -2336,10 +2863,13 @@ ${followUpModal}
       ? `<div class="h-40 overflow-hidden relative"><img src="${escAttr(photoUrl)}" alt="${escAttr(event.title)}" class="w-full h-full object-cover" \/><div class="absolute inset-0 bg-gradient-to-t from-black\/50 to-transparent"><\/div><\/div>`
       : ''}
     <div class="p-6 flex flex-wrap items-start gap-6">
-      <div class="flex-shrink-0">
+      <div class="flex-shrink-0 flex items-center gap-1.5">
         ${agentPhotoUrl
           ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-16 h-16 rounded-full border-2 border-indigo-100 object-cover" \/>`
           : `<div class="w-16 h-16 rounded-full bg-indigo-100 flex items-center justify-center text-xl font-bold text-indigo-600">${escHtml(initials)}<\/div>`}
+        ${agentPhoto2Url
+          ? `<img src="${escAttr(agentPhoto2Url)}" alt="Co-Agent" class="w-16 h-16 rounded-full border-2 border-indigo-100 object-cover" \/>`
+          : ''}
       <\/div>
       <div class="flex-1 min-w-0">
         <div class="flex items-start gap-3 mb-1">
@@ -2522,13 +3052,14 @@ app.post('/agent/:adminToken/guests/add', async (c) => {
   const phone = (form.get('phone') as string | null)?.trim() || null;
   const notes = (form.get('notes') as string | null)?.trim() || null;
   const isRsvp = form.get('is_rsvp') === '1' ? 1 : 0;
+  const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
   )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, notes, now)
+    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now)
     .run();
 
   return c.redirect(`/agent/${adminToken}`);
@@ -2591,13 +3122,14 @@ app.post('/admin/events/:adminToken/guests/add', async (c) => {
   const phone = (form.get('phone') as string | null)?.trim() || null;
   const notes = (form.get('notes') as string | null)?.trim() || null;
   const isRsvp = form.get('is_rsvp') === '1' ? 1 : 0;
+  const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
   )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, notes, now)
+    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now)
     .run();
 
   return c.redirect(`/admin/events/${adminToken}`);
@@ -2673,6 +3205,9 @@ app.get('/rsvp/:rsvpToken', async (c) => {
   const agentPhotoUrl = event.agent_photo_key
     ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
     : null;
+  const agentPhoto2Url = event.agent_photo_2_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_2_key)}`
+    : null;
   const initials = event.agent_name
     .split(' ')
     .map((p) => p[0] ?? '')
@@ -2688,10 +3223,13 @@ app.get('/rsvp/:rsvpToken', async (c) => {
   <div class="hero-overlay absolute inset-0"><\/div>
   <div class="absolute bottom-0 left-0 right-0 px-5 pb-5">
     <div class="max-w-lg mx-auto flex items-end gap-4">
-      <div class="flex-shrink-0">
+      <div class="flex-shrink-0 flex items-center gap-1.5">
         ${agentPhotoUrl
           ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover shadow-xl" style="border-color:var(--gold)" \/>`
           : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold shadow-xl" style="border-color:var(--gold);background:rgba(201,168,76,0.25);color:var(--gold)">${escHtml(initials)}<\/div>`}
+        ${agentPhoto2Url
+          ? `<img src="${escAttr(agentPhoto2Url)}" alt="Co-Agent" class="w-14 h-14 rounded-full border-2 object-cover shadow-xl" style="border-color:var(--gold)" \/>`
+          : ''}
       <\/div>
       <div class="min-w-0 flex-1">
         ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest mb-0.5" style="color:var(--gold)">${escHtml(event.company_name)}<\/p>` : ''}
@@ -2841,10 +3379,10 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
 app.get('/rsvp/:rsvpToken/success', async (c) => {
   const rsvpToken = c.req.param('rsvpToken');
   const event = await c.env.DB.prepare(
-    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, photo_key, start_time, end_time, timezone, property_address FROM events WHERE rsvp_token = ?'
+    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key, start_time, end_time, timezone, property_address FROM events WHERE rsvp_token = ?'
   )
     .bind(rsvpToken)
-    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'photo_key' | 'start_time' | 'end_time' | 'timezone' | 'property_address'>>();
+    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'agent_photo_2_key' | 'photo_key' | 'start_time' | 'end_time' | 'timezone' | 'property_address'>>();
 
   const title = event?.title ?? 'Open House';
   const photoUrl = event?.photo_key
@@ -2852,6 +3390,9 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
     : null;
   const agentPhotoUrl = event?.agent_photo_key
     ? `/api/photo/${encodeURIComponent(event.agent_photo_key)}`
+    : null;
+  const agentPhoto2Url = event?.agent_photo_2_key
+    ? `/api/photo/${encodeURIComponent(event.agent_photo_2_key)}`
     : null;
   const initials = (event?.agent_name ?? '??')
     .split(' ')
@@ -2885,10 +3426,13 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
       <div class="divider mb-6"></div>
       ${event
         ? `<div class="flex items-center justify-center gap-4">
-             <div class="flex-shrink-0">
+             <div class="flex-shrink-0 flex items-center gap-1.5">
                ${agentPhotoUrl
                  ? `<img src="${escAttr(agentPhotoUrl)}" alt="${escAttr(event.agent_name)}" class="w-14 h-14 rounded-full border-2 object-cover" style="border-color:var(--gold)" />`
                  : `<div class="w-14 h-14 rounded-full border-2 flex items-center justify-center text-lg font-bold" style="border-color:var(--gold);background:rgba(201,168,76,0.1);color:var(--gold)">${escHtml(initials)}</div>`}
+               ${agentPhoto2Url
+                 ? `<img src="${escAttr(agentPhoto2Url)}" alt="Co-Agent" class="w-14 h-14 rounded-full border-2 object-cover" style="border-color:var(--gold)" />`
+                 : ''}
              </div>
              <div class="text-left">
                ${event.company_name ? `<p class="text-xs font-semibold uppercase tracking-widest" style="color:var(--gold)">${escHtml(event.company_name)}</p>` : ''}
