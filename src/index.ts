@@ -187,7 +187,7 @@ function formatDateTime(iso: string, timezone: string): string {
   }
 }
 
-function icon(name: 'map' | 'clock' | 'user' | 'mail' | 'phone' | 'calendar' | 'external', cls = 'w-4 h-4'): string {
+function icon(name: 'map' | 'clock' | 'user' | 'mail' | 'phone' | 'calendar' | 'external' | 'document', cls = 'w-4 h-4'): string {
   const paths: Record<string, string> = {
     map: '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
     clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
@@ -195,7 +195,8 @@ function icon(name: 'map' | 'clock' | 'user' | 'mail' | 'phone' | 'calendar' | '
     mail: '<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>',
     phone: '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.81 12.81 0 0 0 .62 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.62A2 2 0 0 1 22 16.92z"/>',
     calendar: '<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
-    external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>'
+    external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>',
+    document: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'
   };
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${cls}">${paths[name]}</svg>`;
 }
@@ -606,6 +607,21 @@ app.get('/api/photo/:key', async (c) => {
   return new Response(obj.body, { headers });
 });
 
+app.get('/api/flyer/:key', async (c) => {
+  const key = c.req.param('key');
+  try {
+    const obj = await c.env.BUCKET.get(key);
+    if (!obj) return c.notFound();
+    const headers = new Headers();
+    obj.writeHttpMetadata(headers);
+    headers.set('Content-Disposition', 'inline');
+    headers.set('cache-control', 'public, max-age=31536000, immutable');
+    return new Response(obj.body, { headers });
+  } catch (err) {
+    return c.text('Error serving flyer', 500);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Guest sign-in page
 // ---------------------------------------------------------------------------
@@ -784,6 +800,7 @@ app.get('/e/:token', async (c) => {
       </p>
       ${event.description ? `<div class="divider my-3"></div><p class="text-gray-500 text-sm italic">${escHtml(event.description)}</p>` : ''}
       ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 text-sm font-medium mt-2" style="color:var(--gold)">View Listing ${icon('external', 'w-3.5 h-3.5')}</a>` : ''}
+      ${event.flyer_key ? `<a href="/api/flyer/${encodeURIComponent(event.flyer_key)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 text-sm font-medium mt-2 ml-4" style="color:var(--gold)">View Flyer ${icon('document', 'w-3.5 h-3.5')}</a>` : ''}
     </div>
     ${formHtml}
     <div class="text-center mt-6 text-slate-500 text-xs space-y-2">
@@ -877,10 +894,10 @@ app.post('/e/:token/signin', async (c) => {
 app.get('/e/:token/success', async (c) => {
   const token = c.req.param('token');
   const event = await c.env.DB.prepare(
-    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key FROM events WHERE public_token = ?'
+    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key, flyer_key FROM events WHERE public_token = ?'
   )
     .bind(token)
-    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'agent_photo_2_key' | 'photo_key'>>();
+    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'agent_photo_2_key' | 'photo_key' | 'flyer_key'>>();
 
   const title = event?.title ?? 'Open House';
   const photoUrl = event?.photo_key
@@ -930,7 +947,15 @@ app.get('/e/:token/success', async (c) => {
                ${event.agent_phone ? `<p class="text-xs text-gray-500">${escHtml(event.agent_phone)}<\/p>` : ''}
              <\/div>
            <\/div>
-           <p class="text-gray-400 text-xs mt-5">Your agent will be in touch soon &mdash; we look forward to helping you find your perfect home!<\/p>`
+           <p class="text-gray-400 text-xs mt-5">Your agent will be in touch soon &mdash; we look forward to helping you find your perfect home!<\/p>
+           ${event.flyer_key
+             ? `<div class="mt-6">
+                  <a href="/api/flyer/${encodeURIComponent(event.flyer_key)}" target="_blank" rel="noopener" class="inline-flex items-center justify-center gap-2 w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-sm font-semibold py-3 px-4 rounded-xl border border-indigo-200 transition-colors shadow-sm">
+                    ${icon('document', 'w-4 h-4')} View Property Flyer / Brochure
+                  </a>
+                </div>`
+             : ''
+           }`
         : ''}
       <div class="mt-6 pt-5 border-t border-gray-100">
         ${equalHousingLogo('text-gray-400')}
@@ -1956,6 +1981,11 @@ ${followUpModal}
       <p class="text-gray-500">&#128205; ${escHtml(event.property_address)}<\/p>
     <\/div>
     <div class="flex gap-2 flex-wrap">
+      <a href="https://www.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(event.title)}&dates=${event.start_time.replace(/[-:]/g, '').split('.')[0]}Z/${event.end_time.replace(/[-:]/g, '').split('.')[0]}Z&details=${encodeURIComponent('Open House Event: ' + event.title + '\nAddress: ' + event.property_address + '\nAgent: ' + event.agent_name + '\nAdmin Token: ' + adminToken)}&location=${encodeURIComponent(event.property_address)}" 
+        target="_blank"
+        class="inline-flex items-center gap-1 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
+        ${icon('calendar', 'w-3.5 h-3.5')} Add to Calendar
+      </a>
       <a href="/agent/${escHtml(adminToken)}" target="_blank"
         class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors">
         &#128100; Agent View
@@ -2051,7 +2081,14 @@ ${followUpModal}
 
       <div class="bg-white rounded-xl shadow p-5">
         <h2 class="font-semibold text-gray-900 mb-3">Property Photo<\/h2>
-        ${photoUrl ? `<div class="mb-3 rounded-lg overflow-hidden"><img src="${escAttr(photoUrl)}" alt="Property" class="w-full h-40 object-cover" \/><\/div>` : '<p class="text-sm text-gray-400 mb-3">No photo uploaded yet.<\/p>'}
+        ${photoUrl
+          ? `<div class="mb-3">
+               <div class="rounded-lg overflow-hidden mb-2"><img src="${escAttr(photoUrl)}" alt="Property" class="w-full h-40 object-cover" \/><\/div>
+               <form method="POST" action="/admin/events/${escHtml(adminToken)}/photo/delete" class="inline">
+                 <button type="submit" onclick="return confirm('Remove property photo?')" class="w-full bg-red-50 hover:bg-red-100 text-red-600 text-xs font-medium py-1.5 rounded-lg border border-red-200 transition-colors">Remove Photo<\/button>
+               </form>
+             <\/div>`
+          : '<p class="text-sm text-gray-400 mb-3">No photo uploaded yet.<\/p>'}
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/photo" enctype="multipart/form-data" class="space-y-2">
           <input type="file" name="photo" accept="image\/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" \/>
           <div class="flex gap-2">
@@ -2062,56 +2099,63 @@ ${followUpModal}
       </div>
 
       <div class="bg-white rounded-xl shadow p-5">
-        <h2 class="font-semibold text-gray-900 mb-3">Agent 1 Photo / Headshot</h2>
-        ${agentPhotoUrl
-          ? `<div class="mb-3 flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
-               <div class="flex items-center gap-3">
-                 <img src="${escAttr(agentPhotoUrl)}" alt="Agent 1" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" />
-                 <span class="text-xs text-gray-500">Current headshot</span>
-               </div>
-               <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo/delete" class="inline">
-                 <button type="submit" onclick="return confirm('Remove Agent 1 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1.5 rounded-lg border border-red-200 font-medium transition-colors">Remove</button>
-               </form>
-             </div>`
-          : '<p class="text-sm text-gray-400 mb-3">No agent 1 photo yet.</p>'}
-        <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo" enctype="multipart/form-data" class="space-y-2">
-          <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
-          <div class="flex gap-2">
-            <button type="submit" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhotoUrl ? 'Replace Photo' : 'Upload Photo'}</button>
-            <button type="button" onclick="openSelectFileModal('agents/', '/admin/events/${escHtml(adminToken)}/agent-photo', 'Select Agent 1 Photo')" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold py-1.5 rounded-lg border border-indigo-200 transition-colors">Select Existing</button>
+        <h2 class="font-semibold text-gray-900 mb-3">Agent Photos / Headshots</h2>
+        
+        <!-- Previews -->
+        <div class="space-y-3 mb-3">
+          ${agentPhotoUrl || agentPhoto2Url ? '' : '<p class="text-sm text-gray-400">No agent photos yet.<\/p>'}
+          
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            ${agentPhotoUrl
+              ? `<div class="flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
+                   <div class="flex items-center gap-3">
+                     <img src="${escAttr(agentPhotoUrl)}" alt="Agent 1" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" \/>
+                     <span class="text-xs text-gray-500 font-medium">Headshot 1<\/span>
+                   </div>
+                   <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo/delete" class="inline">
+                     <button type="submit" onclick="return confirm('Remove Agent 1 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2 py-1 rounded-lg border border-red-200 font-medium transition-colors">Remove<\/button>
+                   <\/form>
+                 <\/div>`
+              : ''
+            }
+            ${agentPhoto2Url
+              ? `<div class="flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
+                   <div class="flex items-center gap-3">
+                     <img src="${escAttr(agentPhoto2Url)}" alt="Agent 2" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" \/>
+                     <span class="text-xs text-gray-500 font-medium">Headshot 2<\/span>
+                   </div>
+                   <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2/delete" class="inline">
+                     <button type="submit" onclick="return confirm('Remove Agent 2 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2 py-1 rounded-lg border border-red-200 font-medium transition-colors">Remove<\/button>
+                   <\/form>
+                 <\/div>`
+              : ''
+            }
           </div>
-        </form>
-      </div>
-
-      <div class="bg-white rounded-xl shadow p-5">
-        <div class="flex items-center justify-between mb-3">
-          <h2 class="font-semibold text-gray-900">Agent 2 Photo / Headshot</h2>
-          <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-            <input type="checkbox" id="toggle-agent-2" onchange="toggleAgent2(this.checked)" class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" ${agentPhoto2Url ? 'checked' : ''} />
-            <span class="text-xs font-medium text-gray-600">Add Second Agent</span>
-          </label>
         </div>
 
-        <div id="agent-2-container" class="${agentPhoto2Url ? '' : 'hidden'} space-y-3">
-          ${agentPhoto2Url
-            ? `<div class="mb-3 flex items-center justify-between gap-3 bg-gray-50 p-2.5 rounded-lg border border-gray-100">
-                 <div class="flex items-center gap-3">
-                   <img src="${escAttr(agentPhoto2Url)}" alt="Agent 2" class="w-12 h-12 rounded-full object-cover border-2 border-indigo-100" />
-                   <span class="text-xs text-gray-500">Current headshot</span>
-                 </div>
-                 <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2/delete" class="inline">
-                   <button type="submit" onclick="return confirm('Remove Agent 2 photo?')" class="text-xs bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1.5 rounded-lg border border-red-200 font-medium transition-colors">Remove</button>
-                 </form>
-               </div>`
-            : '<p class="text-sm text-gray-400 mb-3">No agent 2 photo yet.</p>'}
-          <form method="POST" action="/admin/events/${escHtml(adminToken)}/agent-photo-2" enctype="multipart/form-data" class="space-y-2">
-            <input type="file" name="photo" accept="image/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
-            <div class="flex gap-2">
-              <button type="submit" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${agentPhoto2Url ? 'Replace Photo' : 'Upload Photo'}</button>
-              <button type="button" onclick="openSelectFileModal('agents/', '/admin/events/${escHtml(adminToken)}/agent-photo-2', 'Select Agent 2 Photo')" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold py-1.5 rounded-lg border border-indigo-200 transition-colors">Select Existing</button>
-            </div>
-          </form>
-        </div>
+        <!-- Upload Forms -->
+        ${!(agentPhotoUrl && agentPhoto2Url)
+          ? (() => {
+              const targetAction = !agentPhotoUrl
+                ? `/admin/events/${escHtml(adminToken)}/agent-photo`
+                : `/admin/events/${escHtml(adminToken)}/agent-photo-2`;
+              const label = !agentPhotoUrl ? 'Upload Photo' : 'Add Another Photo';
+              const prefix = 'agents/';
+              return `
+                <form method="POST" action="${targetAction}" enctype="multipart/form-data" class="space-y-2 pt-2 border-t border-gray-100">
+                  <div class="flex items-center justify-between">
+                    <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">${!agentPhotoUrl ? 'Add First Headshot' : 'Add Second Headshot'}<\/span>
+                  </div>
+                  <input type="file" name="photo" accept="image\/*" class="block w-full text-sm text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" \/>
+                  <div class="flex gap-2">
+                    <button type="submit" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium py-1.5 rounded-lg transition-colors">${label}<\/button>
+                    <button type="button" onclick="openSelectFileModal('${prefix}', '${targetAction}', 'Select Agent Headshot')" class="flex-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold py-1.5 rounded-lg border border-indigo-200 transition-colors">Select Existing<\/button>
+                  </div>
+                <\/form>
+              `;
+            })()
+          : ''
+        }
       </div>
 
       <div class="bg-white rounded-xl shadow p-5 border-l-4 border-amber-400">
@@ -2123,7 +2167,7 @@ ${followUpModal}
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-medium text-gray-700 truncate">Flyer attached<\/p>
               <\/div>
-              <a href="${escAttr(flyerUrl)}" target="_blank"
+              <a href="/api/flyer/${encodeURIComponent(event.flyer_key!)}" target="_blank"
                 class="bg-amber-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-amber-700 transition-colors whitespace-nowrap">&#11015; View<\/a>
             <\/div>
             <form method="POST" action="/admin/events/${escHtml(adminToken)}/flyer/delete" class="mb-2">
@@ -2329,7 +2373,7 @@ function renderModalFiles() {
                   '<p class="text-[10px] text-gray-400 truncate">' + f.key + ' &bull; ' + f.sizeFormatted + '<\/p>' +
                 '<\/div>' +
               '<\/div>' +
-              '<button type="button" onclick="selectModalFile(\'' + f.key.replace(/'/g, "\\'") + '\')" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors">Select<\/button>' +
+              '<button type="button" onclick="selectModalFile(' + String.fromCharCode(39) + f.key.replace(/'/g, String.fromCharCode(92) + String.fromCharCode(39)) + String.fromCharCode(39) + ')" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors">Select<\/button>' +
             '<\/div>';
   }
   
@@ -2469,6 +2513,33 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
     'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
   )
     .bind(key, new Date().toISOString(), adminToken)
+    .run();
+
+  return c.redirect(`/admin/events/${adminToken}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin: delete property photo
+// ---------------------------------------------------------------------------
+
+app.post('/admin/events/:adminToken/photo/delete', async (c) => {
+  const adminToken = c.req.param('adminToken');
+  const event = await c.env.DB.prepare(
+    'SELECT id, photo_key FROM events WHERE admin_token = ?'
+  )
+    .bind(adminToken)
+    .first<Pick<Event, 'id' | 'photo_key'>>();
+
+  if (!event) return c.notFound();
+
+  if (event.photo_key) {
+    await deleteR2FileIfUnreferenced(c, event.photo_key);
+  }
+
+  await c.env.DB.prepare(
+    'UPDATE events SET photo_key = NULL, updated_at = ? WHERE admin_token = ?'
+  )
+    .bind(new Date().toISOString(), adminToken)
     .run();
 
   return c.redirect(`/admin/events/${adminToken}`);
@@ -3166,6 +3237,14 @@ ${followUpModal}
         <\/div>
         <p class="text-gray-500 text-sm mb-0.5">&#128205; ${escHtml(event.property_address)}<\/p>
         <p class="text-gray-500 text-sm">&#128336; ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}<\/p>
+        ${event.flyer_key
+          ? `<div class="mt-2.5">
+               <a href="/api/flyer/${encodeURIComponent(event.flyer_key)}" target="_blank" rel="noopener"
+                  class="inline-flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-colors">
+                  ${icon('document', 'w-3 h-3')} View Property Flyer / Brochure
+               </a>
+             </div>`
+          : ''}
       <\/div>
     <\/div>
   <\/div>
@@ -3606,6 +3685,7 @@ app.get('/rsvp/:rsvpToken', async (c) => {
       </p>
       ${event.description ? `<div class="divider my-3"></div><p class="text-gray-500 text-sm italic">${escHtml(event.description)}</p>` : ''}
       ${event.listing_url ? `<a href="${escHtml(event.listing_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 text-sm font-medium mt-2" style="color:var(--gold)">View Listing ${icon('external', 'w-3.5 h-3.5')}</a>` : ''}
+      ${event.flyer_key ? `<a href="/api/flyer/${encodeURIComponent(event.flyer_key)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 text-sm font-medium mt-2 ml-4" style="color:var(--gold)">View Flyer ${icon('document', 'w-3.5 h-3.5')}</a>` : ''}
     </div>
     ${formHtml}
     <div class="text-center mt-6 text-slate-500 text-xs space-y-2">
@@ -3667,10 +3747,10 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
 app.get('/rsvp/:rsvpToken/success', async (c) => {
   const rsvpToken = c.req.param('rsvpToken');
   const event = await c.env.DB.prepare(
-    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key, start_time, end_time, timezone, property_address FROM events WHERE rsvp_token = ?'
+    'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key, start_time, end_time, timezone, property_address, flyer_key FROM events WHERE rsvp_token = ?'
   )
     .bind(rsvpToken)
-    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'agent_photo_2_key' | 'photo_key' | 'start_time' | 'end_time' | 'timezone' | 'property_address'>>();
+    .first<Pick<Event, 'title' | 'agent_name' | 'agent_email' | 'agent_phone' | 'company_name' | 'agent_photo_key' | 'agent_photo_2_key' | 'photo_key' | 'start_time' | 'end_time' | 'timezone' | 'property_address' | 'flyer_key'>>();
 
   const title = event?.title ?? 'Open House';
   const photoUrl = event?.photo_key
@@ -3729,7 +3809,15 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
                ${event.agent_phone ? `<a href="tel:${escAttr(event.agent_phone)}" class="text-xs text-gray-500 hover:underline flex items-center gap-1">${icon('phone', 'w-3 h-3')} ${escHtml(event.agent_phone)}</a>` : ''}
              </div>
            </div>
-           <p class="text-gray-400 text-xs mt-5">We look forward to seeing you there! The agent will be in touch with any updates.</p>`
+           <p class="text-gray-400 text-xs mt-5">We look forward to seeing you there! The agent will be in touch with any updates.</p>
+           ${event.flyer_key
+             ? `<div class="mt-6">
+                  <a href="/api/flyer/${encodeURIComponent(event.flyer_key)}" target="_blank" rel="noopener" class="inline-flex items-center justify-center gap-2 w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-sm font-semibold py-3 px-4 rounded-xl border border-indigo-200 transition-colors shadow-sm">
+                    ${icon('document', 'w-4 h-4')} View Property Flyer / Brochure
+                  </a>
+                </div>`
+             : ''
+           }`
         : ''}
       <div class="mt-6 pt-5 border-t border-gray-100">
         ${equalHousingLogo('text-gray-400')}
