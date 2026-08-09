@@ -379,6 +379,26 @@ function agentNav(agentName: string, companyName: string | null, extra = ''): st
 const app = new Hono<{ Bindings: Bindings }>();
 
 // ---------------------------------------------------------------------------
+// EMERGENCY CONTAINMENT: admin routes disabled pending authentication fix.
+// Must remain the first middleware so it runs before any authorization logic
+// or route handler. Denies unconditionally; no cookie is read or trusted.
+// ---------------------------------------------------------------------------
+
+app.use('*', async (c, next) => {
+  const path = c.req.path;
+
+  if (path === '/admin' || path.startsWith('/admin/')) {
+    return c.body('Admin temporarily unavailable', 503, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Retry-After': '3600',
+    });
+  }
+
+  return await next();
+});
+
+// ---------------------------------------------------------------------------
 // Middleware: Setup & Auth
 // ---------------------------------------------------------------------------
 
