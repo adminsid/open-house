@@ -595,7 +595,7 @@ app.post('/setup', async (c) => {
     path: '/',
     httpOnly: true,
     secure: true,
-    sameSite: 'Lax',
+    sameSite: 'None',
     maxAge: 60 * 60 * 24 * 7,
   });
 
@@ -662,7 +662,7 @@ app.post('/login', async (c) => {
       path: '/',
       httpOnly: true,
       secure: true,
-      sameSite: 'Lax',
+      sameSite: 'None',
       maxAge: 60 * 60 * 24 * 7, // 1 week
     });
     return c.redirect('/admin');
@@ -681,6 +681,8 @@ app.post('/login', async (c) => {
 app.post('/logout', async (c) => {
   setCookie(c, 'admin_session', '', {
     path: '/',
+    secure: true,
+    sameSite: 'None',
     maxAge: 0,
   });
   return c.redirect('/login');
