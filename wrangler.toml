@@ -21,5 +21,6 @@ pattern = "openhouse.primeamericarealestate.com"
 custom_domain = true
 
 [vars]
-ADMIN_SECRET = "change-this-secret-in-production"
 APP_URL = "https://openhouse.primeamericarealestate.com"
+WORKSPACE_URL = "https://workspace.primeamericany.com"
+

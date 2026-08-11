@@ -9,7 +9,6 @@ type Bindings = {
   DB: D1Database;
   KV: KVNamespace;
   BUCKET: R2Bucket;
-  ADMIN_SECRET: string;
   APP_URL: string;
   WORKSPACE_URL?: string;
   INTERNAL_API_SECRET?: string;
