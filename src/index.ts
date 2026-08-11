@@ -1,6 +1,10 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
 import { emitLog, generateRequestId } from './lib/logger';
+import { SESSION_COOKIE, createSession, validateSession, revokeSession, ABSOLUTE_TTL_SECONDS, type Session } from './lib/sessions';
+import { completeSsoLogin } from './lib/sso';
+import { isApprovedOrigin, extractCsrfToken, safeEqual } from './lib/csrf';
+import { recordAudit } from './lib/audit';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,6 +17,10 @@ type Bindings = {
   APP_URL: string;
   WORKSPACE_URL?: string;
   INTERNAL_API_SECRET?: string;
+  // Emergency-containment reopen switch. Only ever set to 'false' in local
+  // test/CI environments; deployed configs must leave it unset so /admin
+  // stays behind the 503 guard until the auth fix is fully verified.
+  CONTAINMENT_ENABLED?: string;
 };
 
 type Admin = {
@@ -92,6 +100,17 @@ function generateToken(byteLength: number = 16): string {
 }
 
 function getUserSession(c: any): { id?: string; email?: string; name?: string; role?: string } | null {
+  // Admin routes set a validated server-side session via the auth middleware;
+  // its trusted identity (captured at SSO validation time) takes precedence.
+  const session = c.get('session') as Session | undefined;
+  if (session) {
+    return {
+      id: session.userId,
+      email: session.userEmail ?? undefined,
+      name: session.userName ?? undefined,
+      role: session.role ?? undefined,
+    };
+  }
   const cookie = getCookie(c, 'openhouse_user');
   if (!cookie) return null;
   try {
@@ -398,7 +417,7 @@ function agentNav(agentName: string, companyName: string | null, extra = ''): st
 // App
 // ---------------------------------------------------------------------------
 
-const app = new Hono<{ Bindings: Bindings }>();
+const app = new Hono<{ Bindings: Bindings; Variables: { session: Session } }>();
 
 // ---------------------------------------------------------------------------
 // EMERGENCY CONTAINMENT: admin routes disabled pending authentication fix.
@@ -407,6 +426,13 @@ const app = new Hono<{ Bindings: Bindings }>();
 // ---------------------------------------------------------------------------
 
 app.use('*', async (c, next) => {
+  // Local/CI Worker tests set CONTAINMENT_ENABLED=false to exercise the
+  // authenticated handlers. Deployed configs never set this var, so
+  // production stays behind the 503 guard until the fix is verified.
+  if (c.env.CONTAINMENT_ENABLED === 'false') {
+    return await next();
+  }
+
   const path = c.req.path;
 
   if (path === '/admin' || path.startsWith('/admin/')) {
@@ -428,9 +454,13 @@ app.use('*', async (c, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Middleware: Setup & Auth
+// Middleware: Setup, SSO callback & admin auth/CSRF
 // ---------------------------------------------------------------------------
 
+// Broad setup/SSO gate: runs for every non-API request. Handles the SSO
+// callback (exchanging the one-time token for a local D1 session) and the
+// first-admin setup redirects. It does NOT itself authorize /admin paths —
+// the dedicated admin middleware below does that with a validated session.
 app.use('*', async (c, next) => {
   const path = c.req.path;
 
@@ -439,54 +469,50 @@ app.use('*', async (c, next) => {
     return await next();
   }
 
-  // Handle SSO Callback (sso_token exchange)
+  // SSO callback: exchange the one-time token server-to-server and create a
+  // local D1 session. Exempt from CSRF because it is authenticated by the
+  // Workspace token exchange, not by a cookie. On failure we never fall
+  // through into an authenticated /admin request.
   const ssoToken = c.req.query('sso_token');
   if (ssoToken) {
     const workspaceUrl = c.env.WORKSPACE_URL || 'https://workspace.primeamericany.com';
-    try {
-      const valRes = await fetch(`${workspaceUrl}/api/sso/validate?token=${encodeURIComponent(ssoToken)}`);
-      if (valRes.ok) {
-        const valData: any = await valRes.json();
-        if (valData.success && valData.data?.user) {
-          const user = valData.data.user;
-          const existingAdmin = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').first<Admin>();
-          const adminId = existingAdmin?.id || user.id;
-
-          const userPayload = JSON.stringify({
-            id: user.id,
-            email: user.email,
-            name: user.name,
-            role: user.role || 'salesperson',
-          });
-
-          setCookie(c, 'admin_session', adminId, {
-            path: '/',
-            httpOnly: true,
-            secure: true,
-            sameSite: 'None',
-            maxAge: 60 * 60 * 24 * 7,
-          });
-
-          setCookie(c, 'openhouse_user', encodeURIComponent(userPayload), {
-            path: '/',
-            httpOnly: true,
-            secure: true,
-            sameSite: 'None',
-            maxAge: 60 * 60 * 24 * 7,
-          });
-
-          const cleanUrl = new URL(c.req.url);
-          cleanUrl.searchParams.delete('sso_token');
-          return c.redirect(cleanUrl.pathname + cleanUrl.search);
-        }
+    const result = await completeSsoLogin(c.env.DB, workspaceUrl, ssoToken, c.req.url);
+    if (result) {
+      setCookie(c, SESSION_COOKIE, result.sessionToken, {
+        path: '/',
+        httpOnly: true,
+        secure: true,
+        sameSite: 'Lax',
+        maxAge: ABSOLUTE_TTL_SECONDS,
+      });
+      // Legacy cookies are dead; clear them so nothing trusts them again.
+      for (const name of ['admin_session', 'openhouse_user']) {
+        setCookie(c, name, '', { path: '/', httpOnly: true, secure: true, sameSite: 'Lax', maxAge: 0 });
       }
-    } catch (e) {
-      console.error('[OPEN HOUSE SSO] Validation failed:', e);
+      emitLog({
+        event: 'admin.auth.success',
+        outcome: 'success',
+        route: path,
+        requestId: c.req.header('cf-ray') ?? generateRequestId(),
+        actorId: result.actorId,
+        tenantId: result.tenantId ?? undefined,
+        clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+      });
+      return c.redirect(result.redirectTo);
+    }
+    if (path === '/admin' || path.startsWith('/admin/')) {
+      emitLog({
+        event: 'admin.auth.failure',
+        outcome: 'denied',
+        route: path,
+        requestId: c.req.header('cf-ray') ?? generateRequestId(),
+        clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+      });
+      return c.text('Sign-in failed', 401);
     }
   }
 
-
-  // Check if any admin exists
+  // First-admin setup flow.
   const { results } = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').all();
   const adminExists = results && results.length > 0;
 
@@ -499,24 +525,9 @@ app.use('*', async (c, next) => {
       return c.redirect('/admin');
     }
 
-    if (path.startsWith('/admin')) {
-      const sessionId = getCookie(c, 'admin_session');
-      if (!sessionId) {
-        if (c.env.WORKSPACE_URL) {
-          const loginUrl = new URL(`${c.env.WORKSPACE_URL}/api/sso/redirect`);
-          loginUrl.searchParams.set('app', new URL(c.req.url).host);
-          const cleanReqUrl = new URL(c.req.url);
-          cleanReqUrl.searchParams.delete('sso_token');
-          loginUrl.searchParams.set('return_to', cleanReqUrl.toString());
-          return c.redirect(loginUrl.toString());
-        }
-        return c.redirect('/login');
-      }
-    }
-
     if (path === '/login') {
-      const sessionId = getCookie(c, 'admin_session');
-      if (sessionId) {
+      const session = await validateSession(c.env.DB, getCookie(c, SESSION_COOKIE) ?? '');
+      if (session) {
         return c.redirect('/admin');
       }
     }
@@ -524,6 +535,131 @@ app.use('*', async (c, next) => {
 
   await next();
 });
+
+// Dedicated /admin gate: server-side session validation plus CSRF. Runs only
+// once the broad gate above has satisfied setup/SSO conditions.
+function approvedOrigin(c: any): string {
+  return c.env.APP_URL || 'https://openhouse.primeamericarealestate.com';
+}
+
+async function adminRequireAuth(c: any, next: any): Promise<Response | void> {
+  const rawToken = getCookie(c, SESSION_COOKIE);
+  const session = await validateSession(c.env.DB, rawToken ?? '');
+  if (!session) {
+    const requestId = c.req.header('cf-ray') ?? generateRequestId();
+    emitLog({
+      event: 'admin.auth.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId,
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    await recordAudit(c.env.DB, {
+      action: 'admin.auth',
+      outcome: 'denied',
+      requestId,
+    }).catch(() => {});
+    // Browser navigations get redirected to the Workspace SSO; everything
+    // else (fetch/XHR/forms) gets a plain 401.
+    const isHtmlNav = c.req.method === 'GET' && (c.req.header('accept') || '').includes('text/html');
+    if (isHtmlNav) {
+      if (c.env.WORKSPACE_URL) {
+        const loginUrl = new URL(`${c.env.WORKSPACE_URL}/api/sso/redirect`);
+        loginUrl.searchParams.set('app', 'openhouse');
+        const clean = new URL(c.req.url);
+        clean.searchParams.delete('sso_token');
+        loginUrl.searchParams.set('return_to', clean.toString());
+        return c.redirect(loginUrl.toString());
+      }
+      return c.redirect('/login');
+    }
+    return c.json({ success: false, error: 'Authentication required' }, 401);
+  }
+  c.set('session', session);
+  return await next();
+}
+
+async function adminRequireCsrf(c: any, next: any): Promise<Response | void> {
+  const method = c.req.method.toUpperCase();
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    return await next();
+  }
+
+  const requestId = c.req.header('cf-ray') ?? generateRequestId();
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId,
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
+  const session = c.get('session') as Session;
+  const submitted = await extractCsrfToken(c.req.raw);
+  if (!submitted || !safeEqual(submitted, session.csrfToken)) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId,
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid CSRF token' }, 403);
+  }
+
+  return await next();
+}
+
+// Inject the session-bound CSRF token into admin HTML pages so their forms
+// and fetch calls carry _csrf / X-CSRF-Token automatically.
+async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
+  await next();
+  if (c.req.method !== 'GET') return;
+  const contentType = c.res.headers.get('content-type') || '';
+  if (!contentType.includes('text/html')) return;
+
+  const session = c.get('session') as Session | undefined;
+  if (!session) return;
+
+  const snippet = `
+  <meta name="csrf-token" content="${escAttr(session.csrfToken)}" />
+  <script>
+  (function() {
+    var token = (document.querySelector('meta[name="csrf-token"]') || {}).getAttribute('content');
+    if (!token) return;
+    document.querySelectorAll('form[method="post" i]').forEach(function(f) {
+      if (f.querySelector('input[name="_csrf"]')) return;
+      var i = document.createElement('input');
+      i.type = 'hidden';
+      i.name = '_csrf';
+      i.value = token;
+      f.appendChild(i);
+    });
+    var origFetch = window.fetch;
+    window.fetch = function(input, init) {
+      var url = typeof input === 'string' ? input : (input && input.url) || '';
+      var method = String(((init && init.method) || (input && input.method) || 'GET')).toUpperCase();
+      if (method !== 'GET' && url.indexOf(location.origin) === 0) {
+        init = init || {};
+        init.headers = init.headers || {};
+        if (init.headers instanceof Headers) init.headers.set('X-CSRF-Token', token);
+        else init.headers['X-CSRF-Token'] = token;
+      }
+      return origFetch.call(this, input, init);
+    };
+  })();
+  </script>`;
+
+  const html = await c.res.text();
+  const injected = html.includes('</head>') ? html.replace('</head>', snippet + '\n</head>') : snippet + html;
+  c.res = new Response(injected, c.res);
+}
+
+app.use('/admin', adminRequireAuth, adminRequireCsrf, adminInjectCsrf);
+app.use('/admin/*', adminRequireAuth, adminRequireCsrf, adminInjectCsrf);
 
 app.get('/', (c) => c.redirect('/admin'));
 
@@ -598,12 +734,18 @@ app.post('/setup', async (c) => {
     .bind(id, username, passwordHash, name, now)
     .run();
 
-  setCookie(c, 'admin_session', id, {
+  const sessionToken = await createSession(c.env.DB, {
+    userId: id,
+    role: 'admin',
+    userEmail: username,
+    userName: name,
+  });
+  setCookie(c, SESSION_COOKIE, sessionToken, {
     path: '/',
     httpOnly: true,
     secure: true,
-    sameSite: 'None',
-    maxAge: 60 * 60 * 24 * 7,
+    sameSite: 'Lax',
+    maxAge: ABSOLUTE_TTL_SECONDS,
   });
 
   return c.redirect('/admin');
@@ -665,12 +807,18 @@ app.post('/login', async (c) => {
     .first<Admin>();
 
   if (admin && admin.password_hash === await hashPassword(password)) {
-    setCookie(c, 'admin_session', admin.id, {
+    const sessionToken = await createSession(c.env.DB, {
+      userId: admin.id,
+      role: 'admin',
+      userEmail: admin.username,
+      userName: admin.name,
+    });
+    setCookie(c, SESSION_COOKIE, sessionToken, {
       path: '/',
       httpOnly: true,
       secure: true,
-      sameSite: 'None',
-      maxAge: 60 * 60 * 24 * 7, // 1 week
+      sameSite: 'Lax',
+      maxAge: ABSOLUTE_TTL_SECONDS,
     });
     return c.redirect('/admin');
   }
@@ -686,12 +834,33 @@ app.post('/login', async (c) => {
 });
 
 app.post('/logout', async (c) => {
-  setCookie(c, 'admin_session', '', {
-    path: '/',
-    secure: true,
-    sameSite: 'None',
-    maxAge: 0,
-  });
+  // Origin check: POST /logout is a state change. It does not require a CSRF
+  // token (there is no session to bind one to when the session is invalid),
+  // but it must come from the approved origin to be a usable CSRF vector.
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: '/logout',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
+  const rawToken = getCookie(c, SESSION_COOKIE);
+  if (rawToken) {
+    await revokeSession(c.env.DB, rawToken);
+  }
+  for (const name of [SESSION_COOKIE, 'admin_session', 'openhouse_user']) {
+    setCookie(c, name, '', {
+      path: '/',
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+      maxAge: 0,
+    });
+  }
   return c.redirect('/login');
 });
 

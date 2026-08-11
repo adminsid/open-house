@@ -10,6 +10,8 @@ export type LogEvent =
   | 'admin.containment.denied'
   | 'admin.auth.success'
   | 'admin.auth.failure'
+  | 'admin.auth.denied'
+  | 'admin.csrf.denied'
   | 'admin.authz.denied'
   | 'audit.record'
   | 'public.event.served'
