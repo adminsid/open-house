@@ -11,6 +11,8 @@ type Bindings = {
   BUCKET: R2Bucket;
   ADMIN_SECRET: string;
   APP_URL: string;
+  WORKSPACE_URL?: string;
+  INTERNAL_API_SECRET?: string;
 };
 
 type Admin = {
@@ -87,6 +89,26 @@ function generateToken(byteLength: number = 16): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(byteLength)))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
+}
+
+function getUserSession(c: any): { id?: string; email?: string; name?: string; role?: string } | null {
+  const cookie = getCookie(c, 'openhouse_user');
+  if (!cookie) return null;
+  try {
+    return JSON.parse(decodeURIComponent(cookie));
+  } catch {
+    return null;
+  }
+}
+
+function isUserAssignedToEvent(user: { email?: string; name?: string; role?: string } | null, ev: Event): boolean {
+  if (!user) return true; // fallback for direct admin login
+  if (user.role === 'admin' || user.role === 'broker') return true;
+  const userEmail = (user.email || '').toLowerCase().trim();
+  const userName = (user.name || '').toLowerCase().trim();
+  const evEmail = (ev.agent_email || '').toLowerCase().trim();
+  const evName = (ev.agent_name || '').toLowerCase().trim();
+  return Boolean((userEmail && evEmail && userEmail === evEmail) || (userName && evName && userName === evName));
 }
 
 async function hashPassword(password: string): Promise<string> {
@@ -405,35 +427,86 @@ app.use('*', async (c, next) => {
 app.use('*', async (c, next) => {
   const path = c.req.path;
 
-  // Always allow API and static-ish routes
+  // Always allow API routes
   if (path.startsWith('/api/')) {
     return await next();
   }
+
+  // Handle SSO Callback (sso_token exchange)
+  const ssoToken = c.req.query('sso_token');
+  if (ssoToken) {
+    const workspaceUrl = c.env.WORKSPACE_URL || 'https://workspace.primeamericany.com';
+    try {
+      const valRes = await fetch(`${workspaceUrl}/api/sso/validate?token=${encodeURIComponent(ssoToken)}`);
+      if (valRes.ok) {
+        const valData: any = await valRes.json();
+        if (valData.success && valData.data?.user) {
+          const user = valData.data.user;
+          const existingAdmin = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').first<Admin>();
+          const adminId = existingAdmin?.id || user.id;
+
+          const userPayload = JSON.stringify({
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            role: user.role || 'salesperson',
+          });
+
+          setCookie(c, 'admin_session', adminId, {
+            path: '/',
+            httpOnly: true,
+            secure: true,
+            sameSite: 'None',
+            maxAge: 60 * 60 * 24 * 7,
+          });
+
+          setCookie(c, 'openhouse_user', encodeURIComponent(userPayload), {
+            path: '/',
+            httpOnly: true,
+            secure: true,
+            sameSite: 'None',
+            maxAge: 60 * 60 * 24 * 7,
+          });
+
+          const cleanUrl = new URL(c.req.url);
+          cleanUrl.searchParams.delete('sso_token');
+          return c.redirect(cleanUrl.pathname + cleanUrl.search);
+        }
+      }
+    } catch (e) {
+      console.error('[OPEN HOUSE SSO] Validation failed:', e);
+    }
+  }
+
 
   // Check if any admin exists
   const { results } = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').all();
   const adminExists = results && results.length > 0;
 
   if (!adminExists) {
-    // If no admin, only allow /setup
     if (path !== '/setup') {
       return c.redirect('/setup');
     }
   } else {
-    // Admin exists: Disable /setup
     if (path === '/setup') {
       return c.redirect('/admin');
     }
 
-    // Protect /admin routes
     if (path.startsWith('/admin')) {
       const sessionId = getCookie(c, 'admin_session');
       if (!sessionId) {
+        if (c.env.WORKSPACE_URL) {
+          const loginUrl = new URL(`${c.env.WORKSPACE_URL}/api/sso/redirect`);
+          loginUrl.searchParams.set('app', new URL(c.req.url).host);
+          const cleanReqUrl = new URL(c.req.url);
+          cleanReqUrl.searchParams.delete('sso_token');
+          loginUrl.searchParams.set('return_to', cleanReqUrl.toString());
+          return c.redirect(loginUrl.toString());
+        }
         return c.redirect('/login');
       }
     }
 
-    // Redirect /login to /admin if already logged in
     if (path === '/login') {
       const sessionId = getCookie(c, 'admin_session');
       if (sessionId) {
@@ -1127,6 +1200,8 @@ function filterEvents(q) {
     url: `/admin/events/${ev.admin_token}`,
   }));
 
+  const userSession = getUserSession(c);
+
   const gridCards = filtered
     .map(({ ev, liveStatus }) => {
       const photoUrl = ev.photo_key
@@ -1137,6 +1212,8 @@ function filterEvents(q) {
       const rsvpCount = a?.rsvp_count ?? 0;
       const checkedIn = a?.checked_in_count ?? 0;
       const searchText = (ev.title + ' ' + ev.property_address + ' ' + ev.agent_name + ' ' + (ev.company_name ?? '')).toLowerCase();
+      const canManage = isUserAssignedToEvent(userSession, ev);
+
       return `
       <div class="bg-white rounded-xl shadow hover:shadow-md transition-shadow border border-gray-100 overflow-hidden"
            data-search="${escAttr(searchText)}">
@@ -1166,15 +1243,20 @@ function filterEvents(q) {
             <\/div>
           <\/div>
           <div class="flex items-center gap-2 flex-wrap">
-            <a href="/admin/events/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#9998; Manage<\/a>
-            <a href="/agent/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128100; Agent<\/a>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/duplicate" class="inline">
-              <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Copy<\/button>
-            <\/form>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
-              onsubmit="return confirm('Move this event to Trash?')">
-              <button type="submit" class="inline-flex items-center gap-1 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465;<\/button>
-            <\/form>
+            ${canManage ? `
+              <a href="/admin/events/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#9998; Manage<\/a>
+              <a href="/agent/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128100; Agent<\/a>
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/duplicate" class="inline">
+                <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Copy<\/button>
+              <\/form>
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
+                onsubmit="return confirm('Move this event to Trash?')">
+                <button type="submit" class="inline-flex items-center gap-1 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465;<\/button>
+              <\/form>
+            ` : `
+              <a href="/e/${escHtml(ev.public_token)}" target="_blank" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128065; Sign-In Page<\/a>
+              <span class="text-xs text-gray-400 italic">Public View (Assigned to ${escHtml(ev.agent_name)})<\/span>
+            `}
           <\/div>
         <\/div>
       <\/div>`;
@@ -1187,6 +1269,8 @@ function filterEvents(q) {
       const totalGuests = a?.total ?? 0;
       const rsvpCount = a?.rsvp_count ?? 0;
       const searchText = (ev.title + ' ' + ev.property_address + ' ' + ev.agent_name + ' ' + (ev.company_name ?? '')).toLowerCase();
+      const canManage = isUserAssignedToEvent(userSession, ev);
+
       return `
       <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0"
           data-search="${escAttr(searchText)}">
@@ -1203,12 +1287,16 @@ function filterEvents(q) {
         <\/td>
         <td class="px-4 py-3">
           <div class="flex items-center gap-2 flex-wrap">
-            <a href="/admin/events/${escHtml(ev.admin_token)}" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded-lg">&#9998; Manage<\/a>
-            <a href="/agent/${escHtml(ev.admin_token)}" class="bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-2 py-1 rounded-lg">Agent<\/a>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
-              onsubmit="return confirm('Move this event to Trash?')">
-              <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-2 py-1 rounded-lg">&#128465;<\/button>
-            <\/form>
+            ${canManage ? `
+              <a href="/admin/events/${escHtml(ev.admin_token)}" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded-lg">&#9998; Manage<\/a>
+              <a href="/agent/${escHtml(ev.admin_token)}" class="bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-2 py-1 rounded-lg">Agent<\/a>
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
+                onsubmit="return confirm('Move this event to Trash?')">
+                <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-2 py-1 rounded-lg">&#128465;<\/button>
+              <\/form>
+            ` : `
+              <a href="/e/${escHtml(ev.public_token)}" target="_blank" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded-lg">&#128065; Public View<\/a>
+            `}
           <\/div>
         <\/td>
       <\/tr>`;
@@ -1863,6 +1951,14 @@ app.get('/admin/events/:adminToken', async (c) => {
     return c.html(
       pageShell('Not Found', '<div class="flex items-center justify-center min-h-screen"><p class="text-gray-500">Event not found.<\/p><\/div>'),
       404
+    );
+  }
+
+  const userSession = getUserSession(c);
+  if (!isUserAssignedToEvent(userSession, event)) {
+    return c.html(
+      pageShell('Forbidden', '<div class="max-w-xl mx-auto py-20 px-4 text-center"><h1 class="text-2xl font-bold text-red-600 mb-2">Access Restricted<\/h1><p class="text-gray-600 mb-6">You are not assigned to manage this open house event. Only the assigned agent or a broker/admin can manage event details.<\/p><a href="/admin" class="inline-block bg-indigo-600 text-white font-medium px-4 py-2 rounded-lg hover:bg-indigo-700">Back to Events<\/a><\/div>'),
+      403
     );
   }
 
