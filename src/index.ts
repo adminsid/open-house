@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
+import { emitLog, generateRequestId } from './lib/logger';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -409,6 +410,13 @@ app.use('*', async (c, next) => {
   const path = c.req.path;
 
   if (path === '/admin' || path.startsWith('/admin/')) {
+    emitLog({
+      event: 'admin.containment.denied',
+      outcome: 'denied',
+      route: '/admin',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
     return c.body('Admin temporarily unavailable', 503, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Cache-Control': 'no-store',

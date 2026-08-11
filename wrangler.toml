@@ -24,3 +24,7 @@ custom_domain = true
 APP_URL = "https://openhouse.primeamericarealestate.com"
 WORKSPACE_URL = "https://workspace.primeamericany.com"
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+
