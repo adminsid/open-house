@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import worker from '../index';
 import { SqliteD1 } from './helpers/d1';
+import { MockR2Bucket } from './helpers/r2';
 import { createSession } from '../lib/sessions';
 
 const ORIGIN = 'https://openhouse.primeamericarealestate.com';
@@ -26,7 +27,7 @@ async function makeEnv(db: SqliteD1, containment: boolean): Promise<Record<strin
   return {
     DB: db as unknown as D1Database,
     KV: {} as unknown as KVNamespace,
-    BUCKET: {} as unknown as R2Bucket,
+    BUCKET: new MockR2Bucket(),
     APP_URL: ORIGIN,
     WORKSPACE_URL: WORKSPACE,
     ADMIN_TENANT_ID: 'tenant_primeamerica',

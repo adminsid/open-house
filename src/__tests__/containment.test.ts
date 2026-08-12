@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import worker from '../index';
+import { MockR2Bucket } from './helpers/r2';
 
 // Read the deployed-style vars from wrangler.toml so the test exercises the
 // real binding shape (minus secrets, which are unset in test).
 const env = {
   DB: {} as unknown as D1Database,
   KV: {} as unknown as KVNamespace,
-  BUCKET: {} as unknown as R2Bucket,
+  BUCKET: new MockR2Bucket(),
   APP_URL: 'https://openhouse.primeamericarealestate.com',
   WORKSPACE_URL: 'https://workspace.primeamericany.com',
 };

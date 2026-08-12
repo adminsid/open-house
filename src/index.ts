@@ -5,6 +5,16 @@ import { SESSION_COOKIE, createSession, validateSession, revokeSession, ABSOLUTE
 import { completeSsoLogin } from './lib/sso';
 import { isApprovedOrigin, extractCsrfToken, safeEqual } from './lib/csrf';
 import { buildAuditStatement, type AuditRecord } from './lib/audit';
+import {
+  enqueueMediaOps,
+  enqueueMediaOpsAtomic,
+  executeMediaGroup,
+  retryMediaOp,
+  listMediaOps,
+  getMediaOp,
+  SAFE_COLUMNS,
+  type MediaOpInput,
+} from './lib/media-ops';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -173,8 +183,10 @@ async function commitAudited(
 }
 
 /** Uniform error page for a failed audited mutation (data change rolled back). */
-function auditedMutationError(c: any, err: unknown, message: string): Response {
-  console.error(`${message}:`, err);
+function auditedMutationError(c: any, _err: unknown, message: string): Response {
+  // The error object is NEVER serialized to logs or responses: it can embed
+  // R2 keys or other sensitive values. Diagnostics live in media_ops.error_code.
+  console.error(JSON.stringify({ event: 'admin.mutation.error', message }));
   const accept = c.req.header('accept') || '';
   if (accept.includes('application/json')) {
     return c.json({ success: false, error: message }, 500);
@@ -193,6 +205,143 @@ function auditedMutationError(c: any, err: unknown, message: string): Response {
   );
 }
 
+/** Trusted actor/request context captured once per request for outbox audit rows. */
+function actorContext(c: any): { actorId: string | null; actorEmail: string | null; tenantId: string | null; requestId: string } {
+  const session = c.get('session') as Session | undefined;
+  return {
+    actorId: session?.userId ?? null,
+    actorEmail: session?.userEmail ?? null,
+    tenantId: session?.tenantId ?? null,
+    requestId: c.req.header('cf-ray') ?? generateRequestId(),
+  };
+}
+
+/** Media-ops reconciliation requires a validated admin/broker session (role check on top of the /admin mount). */
+function requireMediaRole(c: any): boolean {
+  const session = c.get('session') as Session | undefined;
+  return Boolean(session && (session.role === 'admin' || session.role === 'broker'));
+}
+
+/**
+ * Upload a media object via the durable outbox: stage the body under a unique
+ * staging key, then apply_upload (copy to final key + point the event column +
+ * audit atomically). The final key and any replaced old key are handed to the
+ * executor as one idempotent, retryable group. Never returns success unless
+ * the D1 ref change, audit row, and R2 copy all complete.
+ */
+async function uploadMedia(
+  c: any,
+  file: File,
+  key: string,
+  targetEventId: string,
+  targetColumn: string,
+  auditAction: string,
+  contentType: string,
+  oldKey: string | null
+): Promise<Response | void> {
+  if (!(SAFE_COLUMNS as readonly string[]).includes(targetColumn)) {
+    return auditedMutationError(c, new Error('invalid target'), 'Media update failed');
+  }
+  const actor = actorContext(c);
+  try {
+    const stagingKey = `staging/${generateId()}`;
+    await c.env.BUCKET.put(stagingKey, file.stream(), { httpMetadata: { contentType } });
+
+    const ops: MediaOpInput[] = [
+      {
+        action: 'apply_upload',
+        key,
+        stagingKey,
+        targetType: 'event',
+        targetEventId,
+        targetColumn,
+        tenantId: actor.tenantId,
+        auditAction,
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      },
+    ];
+    if (oldKey) {
+      ops.push({
+        action: 'delete',
+        key: oldKey,
+        targetType: 'event',
+        tenantId: actor.tenantId,
+        auditAction,
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      });
+    }
+
+    const groupId = await enqueueMediaOps(c.env.DB, ops);
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Media update failed');
+  } catch (err) {
+    return auditedMutationError(c, err, 'Media update failed');
+  }
+}
+
+/**
+ * Clear an event media column via the durable outbox: the DB ref change, its
+ * audit row, and the R2 delete record(s) commit in ONE batch; the R2 deletes
+ * then run idempotently (refcount-guarded). Never reports success unless the
+ * D1 change, audit row, and R2 deletes all complete.
+ */
+async function deleteEventMedia(
+  c: any,
+  adminToken: string,
+  eventId: string,
+  targetColumn: string,
+  auditAction: string,
+  keys: (string | null | undefined)[]
+): Promise<Response | void> {
+  if (!(SAFE_COLUMNS as readonly string[]).includes(targetColumn)) {
+    return auditedMutationError(c, new Error('invalid target'), 'Media delete failed');
+  }
+  const actor = actorContext(c);
+  const toDelete = keys.filter((k): k is string => Boolean(k));
+  const stmt = c.env.DB.prepare(
+    `UPDATE events SET ${targetColumn} = NULL, updated_at = ? WHERE id = ? AND tenant_id = ?`
+  ).bind(new Date().toISOString(), eventId, sessionTenant(c));
+  try {
+    if (toDelete.length === 0) {
+      await commitAudited(c, { action: auditAction, targetType: 'event', targetId: eventId }, [stmt]);
+      return c.redirect(`/admin/events/${adminToken}`);
+    }
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      [stmt],
+      {
+        action: auditAction,
+        targetType: 'event',
+        targetId: eventId,
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      toDelete.map((key) => ({
+        action: 'delete' as const,
+        key,
+        targetType: 'event',
+        tenantId: actor.tenantId,
+        auditAction,
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      }))
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Media delete failed');
+  } catch (err) {
+    return auditedMutationError(c, err, 'Media delete failed');
+  }
+  return c.redirect(`/admin/events/${adminToken}`);
+}
+
 async function hashPassword(password: string): Promise<string> {
   const msgUint8 = new TextEncoder().encode(password);
   const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
@@ -209,23 +358,6 @@ function getEventStatus(event: Event, now: Date): string {
   if (now < start) return 'scheduled';
   if (now >= start && now <= end) return 'happening_now';
   return 'ended';
-}
-
-async function deleteR2FileIfUnreferenced(c: any, key: string | null | undefined): Promise<void> {
-  if (!key) return;
-  try {
-    const check = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM events WHERE photo_key = ? OR agent_photo_key = ? OR agent_photo_2_key = ? OR flyer_key = ?'
-    )
-      .bind(key, key, key, key)
-      .first() as any;
-
-    if (check && check.count <= 1) {
-      await c.env.BUCKET.delete(key);
-    }
-  } catch (err) {
-    console.error(`Error in deleteR2FileIfUnreferenced for key ${key}:`, err);
-  }
 }
 
 function formatBytes(bytes: number): string {
@@ -1737,8 +1869,8 @@ app.get('/admin/storage/info', async (c) => {
       formattedLimit: '20 GB',
       percentage: Math.min(100, parseFloat(percentage.toFixed(2))),
     });
-  } catch (err: any) {
-    return c.json({ success: false, error: err.message }, 500);
+  } catch {
+    return c.json({ success: false, error: 'Storage info unavailable' }, 500);
   }
 });
 
@@ -1755,8 +1887,8 @@ app.get('/admin/storage', async (c) => {
       }
       cursor = list.truncated ? list.cursor : undefined;
     } while (cursor);
-  } catch (err) {
-    console.error('R2 list error:', err);
+  } catch {
+    console.error(JSON.stringify({ event: 'admin.storage.list.error' }));
   }
 
   const limitBytes = 20 * 1024 * 1024 * 1024; // 20 GB
@@ -1993,6 +2125,7 @@ app.post('/admin/storage/delete', async (c) => {
   const key = form.get('key') as string | null;
   if (!key) return c.redirect('/admin/storage');
 
+  const actor = actorContext(c);
   try {
     const stmts = [
       c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key),
@@ -2000,10 +2133,22 @@ app.post('/admin/storage/delete', async (c) => {
       c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key),
       c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key),
     ];
-    await commitAudited(c, { action: 'admin.storage.delete', targetType: 'storage' }, stmts);
-    await c.env.BUCKET.delete(key).catch((err: unknown) => {
-      console.error('R2 delete error:', err);
-    });
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      stmts,
+      {
+        action: 'admin.storage.delete',
+        targetType: 'storage',
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      [{ action: 'delete', key, targetType: 'storage', tenantId: actor.tenantId, auditAction: 'admin.storage.delete', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Storage delete failed');
   } catch (err) {
     return auditedMutationError(c, err, 'Storage delete failed');
   }
@@ -2018,11 +2163,11 @@ app.post('/admin/storage/bulk-delete', async (c) => {
   let keys: string[];
   try {
     keys = JSON.parse(keysStr) as string[];
-  } catch (err) {
-    console.error('Bulk delete parse error:', err);
+  } catch {
     return c.redirect('/admin/storage');
   }
 
+  const actor = actorContext(c);
   try {
     const stmts: D1PreparedStatement[] = [];
     for (const key of keys) {
@@ -2031,12 +2176,31 @@ app.post('/admin/storage/bulk-delete', async (c) => {
       stmts.push(c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key));
       stmts.push(c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key));
     }
-    await commitAudited(c, { action: 'admin.storage.bulk_delete', targetType: 'storage' }, stmts);
-    for (const key of keys) {
-      await c.env.BUCKET.delete(key).catch((err: unknown) => {
-        console.error('R2 delete error for key ' + key + ':', err);
-      });
-    }
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      stmts,
+      {
+        action: 'admin.storage.bulk_delete',
+        targetType: 'storage',
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      keys.map((key) => ({
+        action: 'delete' as const,
+        key,
+        targetType: 'storage',
+        tenantId: actor.tenantId,
+        auditAction: 'admin.storage.bulk_delete',
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      }))
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Bulk delete failed');
   } catch (err) {
     return auditedMutationError(c, err, 'Bulk delete failed');
   }
@@ -2051,31 +2215,58 @@ app.post('/admin/storage/rename', async (c) => {
   const form = await c.req.formData();
   const oldKey = form.get('oldKey') as string | null;
   const newKey = form.get('newKey') as string | null;
-  
+
   if (oldKey && newKey && oldKey !== newKey) {
+    const actor = actorContext(c);
+    const oldObj = await c.env.BUCKET.get(oldKey).catch(() => null);
+    if (!oldObj) {
+      return c.text('Source file not found', 404);
+    }
+
+    // Copy is the one R2 write that must precede the DB repoint. If it fails,
+    // nothing was created and no references changed; the request fails cleanly.
     try {
-      const oldObj = await c.env.BUCKET.get(oldKey);
-      if (!oldObj) {
-        return c.text('Source file not found', 404);
-      }
-      
       await c.env.BUCKET.put(newKey, oldObj.body, {
         httpMetadata: oldObj.httpMetadata,
-        customMetadata: oldObj.customMetadata
+        customMetadata: oldObj.customMetadata,
       });
-      
-      await c.env.BUCKET.delete(oldKey);
+    } catch {
+      return c.text('Rename failed', 500);
+    }
 
-      const stmts = [
-        c.env.DB.prepare('UPDATE events SET photo_key = ? WHERE photo_key = ?').bind(newKey, oldKey),
-        c.env.DB.prepare('UPDATE events SET agent_photo_key = ? WHERE agent_photo_key = ?').bind(newKey, oldKey),
-        c.env.DB.prepare('UPDATE events SET agent_photo_2_key = ? WHERE agent_photo_2_key = ?').bind(newKey, oldKey),
-        c.env.DB.prepare('UPDATE events SET flyer_key = ? WHERE flyer_key = ?').bind(newKey, oldKey),
-      ];
-      await commitAudited(c, { action: 'admin.storage.rename', targetType: 'storage' }, stmts);
-    } catch (err: any) {
-      console.error('Rename error:', err);
-      return c.text(`Rename failed: ${err.message}`, 500);
+    const stmts = [
+      c.env.DB.prepare('UPDATE events SET photo_key = ? WHERE photo_key = ?').bind(newKey, oldKey),
+      c.env.DB.prepare('UPDATE events SET agent_photo_key = ? WHERE agent_photo_key = ?').bind(newKey, oldKey),
+      c.env.DB.prepare('UPDATE events SET agent_photo_2_key = ? WHERE agent_photo_2_key = ?').bind(newKey, oldKey),
+      c.env.DB.prepare('UPDATE events SET flyer_key = ? WHERE flyer_key = ?').bind(newKey, oldKey),
+    ];
+    try {
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        stmts,
+        {
+          action: 'admin.storage.rename',
+          targetType: 'storage',
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'storage', tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Rename failed');
+    } catch {
+      // The D1 repoint failed after the copy succeeded: newKey is orphaned.
+      // Record a durable delete so it is cleaned up via the media-ops outbox.
+      const orphanGroup = await enqueueMediaOps(c.env.DB, [
+        { action: 'delete', key: newKey, targetType: 'storage', tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId },
+      ]).catch(() => null);
+      if (orphanGroup) {
+        await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, orphanGroup);
+      }
+      return c.text('Rename failed', 500);
     }
   }
   return c.redirect('/admin/storage');
@@ -2106,9 +2297,84 @@ app.get('/admin/storage/list', async (c) => {
     }));
 
     return c.json({ success: true, files });
-  } catch (err: any) {
-    return c.json({ success: false, error: err.message }, 500);
+  } catch {
+    return c.json({ success: false, error: 'Storage listing failed' }, 500);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Admin: media operations reconciliation (R2 + D1 consistency outbox)
+// ---------------------------------------------------------------------------
+
+app.get('/admin/media-ops', async (c) => {
+  if (!requireMediaRole(c)) return c.json({ success: false, error: 'Forbidden' }, 403);
+  const ops = await listMediaOps(c.env.DB);
+
+  const rows = ops
+    .map(
+      (op) => `
+      <tr class="border-t border-gray-200">
+        <td class="px-4 py-2 text-sm font-mono text-gray-900">${escHtml(op.id)}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${escHtml(op.action)}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${escHtml(op.status)}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${op.attempts}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${escHtml(op.errorCode ?? '')}</td>
+        <td class="px-4 py-2 text-sm text-gray-500">${escHtml(op.createdAt)}</td>
+        <td class="px-4 py-2 text-sm">
+          ${op.status === 'failed' ? `<form action="/admin/media-ops/retry/${encodeURIComponent(op.id)}" method="POST" class="inline"><button type="submit" class="text-indigo-600 underline">Retry</button></form>` : ''}
+        </td>
+      </tr>`
+    )
+    .join('');
+
+  const body = `
+    <div class="max-w-6xl mx-auto p-6">
+      <h1 class="text-xl font-bold text-gray-900 mb-2">Media Operations</h1>
+      <p class="text-sm text-gray-500 mb-4">R2 + D1 consistency outbox. A request only reports success once its D1 change, audit row, and R2 operation all complete. A 500 response may leave an operation pending reconciliation — it is not rolled back. Retries are idempotent, refcount-guarded, and serialized per group. Object keys are intentionally not displayed.</p>
+      ${ops.length === 0 ? '<p class="text-gray-500">No pending or failed media operations.</p>' : `
+      <table class="w-full text-left border border-gray-200 rounded-lg overflow-hidden">
+        <thead class="bg-gray-50 text-gray-600 text-xs uppercase">
+          <tr>
+            <th class="px-4 py-2">Op ID</th>
+            <th class="px-4 py-2">Action</th>
+            <th class="px-4 py-2">Status</th>
+            <th class="px-4 py-2">Attempts</th>
+            <th class="px-4 py-2">Error code</th>
+            <th class="px-4 py-2">Created</th>
+            <th class="px-4 py-2"></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`}
+    </div>`;
+
+  return c.html(pageShell('Media Operations', adminNav(`<a href="/admin/media-ops" class="text-indigo-600 text-sm font-medium">Media Ops<\/a>`) + body));
+});
+
+app.post('/admin/media-ops/retry/:opId', async (c) => {
+  if (!requireMediaRole(c)) return c.json({ success: false, error: 'Forbidden' }, 403);
+  const opId = c.req.param('opId');
+  const existing = await getMediaOp(c.env.DB, opId);
+  if (!existing) return c.notFound();
+
+  // Audit the retry action itself (opaque op id only; never a storage key).
+  try {
+    await commitAudited(c, { action: 'admin.media_ops.retry', targetType: 'media_op', targetId: opId }, []);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Retry audit failed');
+  }
+
+  const result = await retryMediaOp({ BUCKET: c.env.BUCKET }, c.env.DB, opId);
+  if (!result.ok) {
+    // A 500 here does NOT mean the durable op was rolled back: the outbox op
+    // may be pending or in progress and is reconciled on the Media Operations
+    // page. Never surface op details or keys.
+    return c.html(
+      pageShell('Error', '<div class="flex items-center justify-center min-h-screen"><p class="text-gray-500">Retry did not complete; the operation may be pending reconciliation. Review the Media Operations page.<\/p><\/div>'),
+      500
+    );
+  }
+  return c.redirect('/admin/media-ops');
 });
 
 function buildTabBar(activeFilter: string, counts: Record<string, number>, view: string): string {
@@ -2917,15 +3183,38 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
   const existingKey = form.get('existing_key') as string | null;
 
   if (existingKey) {
-    if (event.photo_key && event.photo_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.photo_key);
+    const oldKey = event.photo_key && event.photo_key !== existingKey ? event.photo_key : null;
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.photo', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Photo update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
     }
+    const actor = actorContext(c);
     try {
-      const stmt = c.env.DB.prepare(
-        'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
-      )
-        .bind(existingKey, new Date().toISOString(), adminToken);
-      await commitAudited(c, { action: 'admin.event.photo', targetType: 'event', targetId: event.id }, [stmt]);
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.photo',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Photo update failed');
     } catch (err) {
       return auditedMutationError(c, err, 'Photo update failed');
     }
@@ -2938,26 +3227,10 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  if (event.photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.photo_key);
-  }
-
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `events/${event.id}/${generateId()}.${ext}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: file.type || 'image/jpeg' },
-  });
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(key, new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.photo', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Photo update failed');
-  }
+  const res = await uploadMedia(c, file, key, event.id, 'photo_key', 'admin.event.photo', file.type || 'image/jpeg', event.photo_key || null);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -2976,19 +3249,8 @@ app.post('/admin/events/:adminToken/photo/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  if (event.photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.photo_key);
-  }
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET photo_key = NULL, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.photo_delete', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Photo delete failed');
-  }
+  const res = await deleteEventMedia(c, adminToken, event.id, 'photo_key', 'admin.event.photo_delete', [event.photo_key]);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3011,15 +3273,38 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
   const existingKey = form.get('existing_key') as string | null;
 
   if (existingKey) {
-    if (event.agent_photo_key && event.agent_photo_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
+    const oldKey = event.agent_photo_key && event.agent_photo_key !== existingKey ? event.agent_photo_key : null;
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.agent_photo', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Agent photo update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
     }
+    const actor = actorContext(c);
     try {
-      const stmt = c.env.DB.prepare(
-        'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
-      )
-        .bind(existingKey, new Date().toISOString(), adminToken);
-      await commitAudited(c, { action: 'admin.event.agent_photo', targetType: 'event', targetId: event.id }, [stmt]);
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.agent_photo',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Agent photo update failed');
     } catch (err) {
       return auditedMutationError(c, err, 'Agent photo update failed');
     }
@@ -3032,26 +3317,10 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  if (event.agent_photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
-  }
-
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `agents/${event.id}/${generateId()}.${ext}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: file.type || 'image/jpeg' },
-  });
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(key, new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.agent_photo', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Agent photo update failed');
-  }
+  const res = await uploadMedia(c, file, key, event.id, 'agent_photo_key', 'admin.event.agent_photo', file.type || 'image/jpeg', event.agent_photo_key || null);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3074,15 +3343,38 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
   const existingKey = form.get('existing_key') as string | null;
 
   if (existingKey) {
-    if (event.agent_photo_2_key && event.agent_photo_2_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
+    const oldKey = event.agent_photo_2_key && event.agent_photo_2_key !== existingKey ? event.agent_photo_2_key : null;
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.agent_photo_2', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Agent photo 2 update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
     }
+    const actor = actorContext(c);
     try {
-      const stmt = c.env.DB.prepare(
-        'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
-      )
-        .bind(existingKey, new Date().toISOString(), adminToken);
-      await commitAudited(c, { action: 'admin.event.agent_photo_2', targetType: 'event', targetId: event.id }, [stmt]);
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.agent_photo_2',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo_2', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Agent photo 2 update failed');
     } catch (err) {
       return auditedMutationError(c, err, 'Agent photo 2 update failed');
     }
@@ -3095,26 +3387,10 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  if (event.agent_photo_2_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
-  }
-
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `agents/${event.id}/${generateId()}_2.${ext}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: file.type || 'image/jpeg' },
-  });
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(key, new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.agent_photo_2', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Agent photo 2 update failed');
-  }
+  const res = await uploadMedia(c, file, key, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2', file.type || 'image/jpeg', event.agent_photo_2_key || null);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3133,19 +3409,8 @@ app.post('/admin/events/:adminToken/agent-photo/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  if (event.agent_photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
-  }
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET agent_photo_key = NULL, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.agent_photo_delete', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Agent photo delete failed');
-  }
+  const res = await deleteEventMedia(c, adminToken, event.id, 'agent_photo_key', 'admin.event.agent_photo_delete', [event.agent_photo_key]);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3160,19 +3425,8 @@ app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  if (event.agent_photo_2_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
-  }
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET agent_photo_2_key = NULL, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.agent_photo_2_delete', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Agent photo 2 delete failed');
-  }
+  const res = await deleteEventMedia(c, adminToken, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2_delete', [event.agent_photo_2_key]);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3195,15 +3449,38 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
   const existingKey = form.get('existing_key') as string | null;
 
   if (existingKey) {
-    if (event.flyer_key && event.flyer_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.flyer_key);
+    const oldKey = event.flyer_key && event.flyer_key !== existingKey ? event.flyer_key : null;
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.flyer', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Flyer update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
     }
+    const actor = actorContext(c);
     try {
-      const stmt = c.env.DB.prepare(
-        'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
-      )
-        .bind(existingKey, new Date().toISOString(), adminToken);
-      await commitAudited(c, { action: 'admin.event.flyer', targetType: 'event', targetId: event.id }, [stmt]);
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.flyer',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.flyer', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Flyer update failed');
     } catch (err) {
       return auditedMutationError(c, err, 'Flyer update failed');
     }
@@ -3234,25 +3511,9 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
     );
   }
 
-  if (event.flyer_key) {
-    await deleteR2FileIfUnreferenced(c, event.flyer_key);
-  }
-
   const key = `flyers/${event.id}/${generateId()}.${rawExt}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: safeContentType },
-  });
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(key, new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.flyer', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Flyer update failed');
-  }
+  const res = await uploadMedia(c, file, key, event.id, 'flyer_key', 'admin.event.flyer', safeContentType, event.flyer_key || null);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3271,19 +3532,8 @@ app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  if (event.flyer_key) {
-    await deleteR2FileIfUnreferenced(c, event.flyer_key);
-  }
-
-  try {
-    const stmt = c.env.DB.prepare(
-      'UPDATE events SET flyer_key = NULL, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(new Date().toISOString(), adminToken);
-    await commitAudited(c, { action: 'admin.event.flyer_delete', targetType: 'event', targetId: event.id }, [stmt]);
-  } catch (err) {
-    return auditedMutationError(c, err, 'Flyer delete failed');
-  }
+  const res = await deleteEventMedia(c, adminToken, event.id, 'flyer_key', 'admin.event.flyer_delete', [event.flyer_key]);
+  if (res) return res;
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3440,22 +3690,43 @@ app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  if (event.photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.photo_key);
-  }
-  if (event.agent_photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
-  }
-  if (event.agent_photo_2_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
-  }
-  if (event.flyer_key) {
-    await deleteR2FileIfUnreferenced(c, event.flyer_key);
-  }
+  const actor = actorContext(c);
+  const mediaKeys = [event.photo_key, event.agent_photo_key, event.agent_photo_2_key, event.flyer_key].filter(
+    (k): k is string => Boolean(k)
+  );
+  const stmt = c.env.DB.prepare('DELETE FROM events WHERE id = ? AND tenant_id = ?').bind(event.id, sessionTenant(c));
 
   try {
-    const stmt = c.env.DB.prepare('DELETE FROM events WHERE id = ?').bind(event.id);
-    await commitAudited(c, { action: 'admin.event.permanent_delete', targetType: 'event', targetId: event.id }, [stmt]);
+    if (mediaKeys.length === 0) {
+      await commitAudited(c, { action: 'admin.event.permanent_delete', targetType: 'event', targetId: event.id }, [stmt]);
+      return c.redirect('/admin?filter=deleted');
+    }
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      [stmt],
+      {
+        action: 'admin.event.permanent_delete',
+        targetType: 'event',
+        targetId: event.id,
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      mediaKeys.map((key) => ({
+        action: 'delete' as const,
+        key,
+        targetType: 'event',
+        tenantId: actor.tenantId,
+        auditAction: 'admin.event.permanent_delete',
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      }))
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Permanent delete failed');
   } catch (err) {
     return auditedMutationError(c, err, 'Permanent delete failed');
   }

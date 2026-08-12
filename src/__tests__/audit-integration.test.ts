@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import worker from '../index';
 import { SqliteD1 } from './helpers/d1';
+import { MockR2Bucket } from './helpers/r2';
 import { createSession } from '../lib/sessions';
 import { auditParams } from '../lib/audit';
 
@@ -27,7 +28,7 @@ async function makeEnv(db: SqliteD1): Promise<Record<string, unknown>> {
   return {
     DB: db as unknown as D1Database,
     KV: {} as unknown as KVNamespace,
-    BUCKET: {} as unknown as R2Bucket,
+    BUCKET: new MockR2Bucket(),
     APP_URL: ORIGIN,
     WORKSPACE_URL: WORKSPACE,
     ADMIN_TENANT_ID: 'tenant_primeamerica',

@@ -29,6 +29,7 @@ export const APPLIED_MIGRATIONS = [
   '007_admin_audit.sql',
   '008_events_tenant_id.sql',
   '010_admin_sessions.sql',
+  '011_media_ops.sql',
 ];
 
 interface D1Result {
