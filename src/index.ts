@@ -4,7 +4,7 @@ import { emitLog, generateRequestId } from './lib/logger';
 import { SESSION_COOKIE, createSession, validateSession, revokeSession, ABSOLUTE_TTL_SECONDS, type Session } from './lib/sessions';
 import { completeSsoLogin } from './lib/sso';
 import { isApprovedOrigin, extractCsrfToken, safeEqual } from './lib/csrf';
-import { recordAudit } from './lib/audit';
+import { buildAuditStatement, type AuditRecord } from './lib/audit';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -145,6 +145,52 @@ function sessionTenant(c: any): string {
     throw new AuthError('No validated server-side tenant for request');
   }
   return session.tenantId;
+}
+
+/**
+ * Commit one or more data-change statements AND the audit record for them in a
+ * single atomic batch. If the audit INSERT fails, the whole batch fails and
+ * the data change does not persist (fail-closed audit trail). The caller is
+ * responsible for catching the error and returning an error response.
+ */
+async function commitAudited(
+  c: any,
+  record: Omit<AuditRecord, 'actorId' | 'actorEmail' | 'tenantId' | 'outcome' | 'requestId'>,
+  stmts: D1PreparedStatement[]
+): Promise<void> {
+  const session = c.get('session') as Session | undefined;
+  const auditStmt = await buildAuditStatement(c.env.DB, {
+    actorId: session?.userId,
+    actorEmail: session?.userEmail ?? undefined,
+    tenantId: session?.tenantId ?? undefined,
+    action: record.action,
+    targetType: record.targetType,
+    targetId: record.targetId,
+    outcome: 'success',
+    requestId: c.req.header('cf-ray') ?? generateRequestId(),
+  });
+  await c.env.DB.batch([...stmts, auditStmt]);
+}
+
+/** Uniform error page for a failed audited mutation (data change rolled back). */
+function auditedMutationError(c: any, err: unknown, message: string): Response {
+  console.error(`${message}:`, err);
+  const accept = c.req.header('accept') || '';
+  if (accept.includes('application/json')) {
+    return c.json({ success: false, error: message }, 500);
+  }
+  return c.html(
+    pageShell(
+      'Error',
+      `<div class="flex items-center justify-center min-h-screen">
+        <div class="text-center p-8">
+          <h1 class="text-xl font-bold text-red-600 mb-2">${escHtml(message)}<\/h1>
+          <a href="/admin" class="text-indigo-600 underline">Go back<\/a>
+        <\/div>
+      <\/div>`
+    ),
+    500
+  );
 }
 
 async function hashPassword(password: string): Promise<string> {
@@ -571,11 +617,8 @@ async function adminRequireAuth(c: any, next: any): Promise<Response | void> {
       requestId,
       clientCountry: c.req.header('cf-ipcountry') ?? undefined,
     });
-    await recordAudit(c.env.DB, {
-      action: 'admin.auth',
-      outcome: 'denied',
-      requestId,
-    }).catch(() => {});
+    // Denied-auth attempts are logged, not persisted to admin_audit: the
+    // audit table records only mutations/outcomes that were authorized.
     // Browser navigations get redirected to the Workspace SSO; everything
     // else (fetch/XHR/forms) gets a plain 401.
     const isHtmlNav = c.req.method === 'GET' && (c.req.header('accept') || '').includes('text/html');
@@ -1921,15 +1964,21 @@ app.get('/admin/storage', async (c) => {
 app.post('/admin/storage/delete', async (c) => {
   const form = await c.req.formData();
   const key = form.get('key') as string | null;
-  if (key) {
+  if (!key) return c.redirect('/admin/storage');
+
+  try {
+    const stmts = [
+      c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key),
+      c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key),
+      c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key),
+      c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key),
+    ];
+    await commitAudited(c, { action: 'admin.storage.delete', targetType: 'storage' }, stmts);
     await c.env.BUCKET.delete(key).catch((err: unknown) => {
       console.error('R2 delete error:', err);
     });
-
-    await c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key).run();
-    await c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key).run();
-    await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key).run();
-    await c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key).run();
+  } catch (err) {
+    return auditedMutationError(c, err, 'Storage delete failed');
   }
   return c.redirect('/admin/storage');
 });
@@ -1937,22 +1986,32 @@ app.post('/admin/storage/delete', async (c) => {
 app.post('/admin/storage/bulk-delete', async (c) => {
   const form = await c.req.formData();
   const keysStr = form.get('keys') as string | null;
-  if (keysStr) {
-    try {
-      const keys = JSON.parse(keysStr) as string[];
-      for (const key of keys) {
-        await c.env.BUCKET.delete(key).catch((err: unknown) => {
-          console.error('R2 delete error for key ' + key + ':', err);
-        });
+  if (!keysStr) return c.redirect('/admin/storage');
 
-        await c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key).run();
-        await c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key).run();
-        await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key).run();
-        await c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key).run();
-      }
-    } catch (err) {
-      console.error('Bulk delete parse error:', err);
+  let keys: string[];
+  try {
+    keys = JSON.parse(keysStr) as string[];
+  } catch (err) {
+    console.error('Bulk delete parse error:', err);
+    return c.redirect('/admin/storage');
+  }
+
+  try {
+    const stmts: D1PreparedStatement[] = [];
+    for (const key of keys) {
+      stmts.push(c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key));
+      stmts.push(c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key));
+      stmts.push(c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key));
+      stmts.push(c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key));
     }
+    await commitAudited(c, { action: 'admin.storage.bulk_delete', targetType: 'storage' }, stmts);
+    for (const key of keys) {
+      await c.env.BUCKET.delete(key).catch((err: unknown) => {
+        console.error('R2 delete error for key ' + key + ':', err);
+      });
+    }
+  } catch (err) {
+    return auditedMutationError(c, err, 'Bulk delete failed');
   }
   return c.redirect('/admin/storage');
 });
@@ -1980,11 +2039,13 @@ app.post('/admin/storage/rename', async (c) => {
       
       await c.env.BUCKET.delete(oldKey);
 
-      await c.env.DB.prepare('UPDATE events SET photo_key = ? WHERE photo_key = ?').bind(newKey, oldKey).run();
-      await c.env.DB.prepare('UPDATE events SET agent_photo_key = ? WHERE agent_photo_key = ?').bind(newKey, oldKey).run();
-      await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = ? WHERE agent_photo_2_key = ?').bind(newKey, oldKey).run();
-      await c.env.DB.prepare('UPDATE events SET flyer_key = ? WHERE flyer_key = ?').bind(newKey, oldKey).run();
-      
+      const stmts = [
+        c.env.DB.prepare('UPDATE events SET photo_key = ? WHERE photo_key = ?').bind(newKey, oldKey),
+        c.env.DB.prepare('UPDATE events SET agent_photo_key = ? WHERE agent_photo_key = ?').bind(newKey, oldKey),
+        c.env.DB.prepare('UPDATE events SET agent_photo_2_key = ? WHERE agent_photo_2_key = ?').bind(newKey, oldKey),
+        c.env.DB.prepare('UPDATE events SET flyer_key = ? WHERE flyer_key = ?').bind(newKey, oldKey),
+      ];
+      await commitAudited(c, { action: 'admin.storage.rename', targetType: 'storage' }, stmts);
     } catch (err: any) {
       console.error('Rename error:', err);
       return c.text(`Rename failed: ${err.message}`, 500);
@@ -2135,12 +2196,13 @@ app.post('/admin/events/new', async (c) => {
   const endUtc = toUtc(end_time, timezone);
 
   try {
-    await c.env.DB.prepare(
+    const insertStmt = c.env.DB.prepare(
       `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
     )
-      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token, rsvp_token, sessionTenant(c), now, now)
-      .run();
+      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token, rsvp_token, sessionTenant(c), now, now);
+
+    await commitAudited(c, { action: 'admin.event.create', targetType: 'event', targetId: id }, [insertStmt]);
 
     return c.redirect(`/admin/events/${admin_token}`);
   } catch (err: any) {
@@ -2778,31 +2840,36 @@ app.post('/admin/events/:adminToken/update', async (c) => {
   const startTimeUtc = toUtc((form.get('start_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
   const endTimeUtc = toUtc((form.get('end_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
 
-  await c.env.DB.prepare(
-    `UPDATE events SET
-      title = ?, property_address = ?, agent_name = ?, agent_email = ?, agent_phone = ?,
-      company_name = ?, description = ?, start_time = ?, end_time = ?, timezone = ?,
-      listing_url = ?, updated_at = ?
-     WHERE admin_token = ?`
-  )
-    .bind(
-      (form.get('title') as string)?.trim(),
-      (form.get('property_address') as string)?.trim(),
-      (form.get('agent_name') as string)?.trim(),
-      (form.get('agent_email') as string)?.trim(),
-      (form.get('agent_phone') as string | null)?.trim() || null,
-      (form.get('company_name') as string | null)?.trim() || null,
-      (form.get('description') as string | null)?.trim() || null,
-      startTimeUtc,
-      endTimeUtc,
-      (form.get('timezone') as string)?.trim() || 'America/New_York',
-      (form.get('listing_url') as string | null)?.trim() || null,
-      now,
-      adminToken
+  try {
+    const updateStmt = c.env.DB.prepare(
+      `UPDATE events SET
+        title = ?, property_address = ?, agent_name = ?, agent_email = ?, agent_phone = ?,
+        company_name = ?, description = ?, start_time = ?, end_time = ?, timezone = ?,
+        listing_url = ?, updated_at = ?
+       WHERE admin_token = ?`
     )
-    .run();
+      .bind(
+        (form.get('title') as string)?.trim(),
+        (form.get('property_address') as string)?.trim(),
+        (form.get('agent_name') as string)?.trim(),
+        (form.get('agent_email') as string)?.trim(),
+        (form.get('agent_phone') as string | null)?.trim() || null,
+        (form.get('company_name') as string | null)?.trim() || null,
+        (form.get('description') as string | null)?.trim() || null,
+        startTimeUtc,
+        endTimeUtc,
+        (form.get('timezone') as string)?.trim() || 'America/New_York',
+        (form.get('listing_url') as string | null)?.trim() || null,
+        now,
+        adminToken
+      );
 
-  return c.redirect(`/admin/events/${adminToken}`);
+    await commitAudited(c, { action: 'admin.event.update', targetType: 'event', targetId: event.id }, [updateStmt]);
+
+    return c.redirect(`/admin/events/${adminToken}`);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Update failed');
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -2826,11 +2893,15 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
     if (event.photo_key && event.photo_key !== existingKey) {
       await deleteR2FileIfUnreferenced(c, event.photo_key);
     }
-    await c.env.DB.prepare(
-      'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+    try {
+      const stmt = c.env.DB.prepare(
+        'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
+      )
+        .bind(existingKey, new Date().toISOString(), adminToken);
+      await commitAudited(c, { action: 'admin.event.photo', targetType: 'event', targetId: event.id }, [stmt]);
+    } catch (err) {
+      return auditedMutationError(c, err, 'Photo update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -2851,11 +2922,15 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
     httpMetadata: { contentType: file.type || 'image/jpeg' },
   });
 
-  await c.env.DB.prepare(
-    'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(key, new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.photo', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Photo update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -2878,11 +2953,15 @@ app.post('/admin/events/:adminToken/photo/delete', async (c) => {
     await deleteR2FileIfUnreferenced(c, event.photo_key);
   }
 
-  await c.env.DB.prepare(
-    'UPDATE events SET photo_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET photo_key = NULL, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.photo_delete', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Photo delete failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -2908,11 +2987,15 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
     if (event.agent_photo_key && event.agent_photo_key !== existingKey) {
       await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
     }
-    await c.env.DB.prepare(
-      'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+    try {
+      const stmt = c.env.DB.prepare(
+        'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
+      )
+        .bind(existingKey, new Date().toISOString(), adminToken);
+      await commitAudited(c, { action: 'admin.event.agent_photo', targetType: 'event', targetId: event.id }, [stmt]);
+    } catch (err) {
+      return auditedMutationError(c, err, 'Agent photo update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -2933,11 +3016,15 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
     httpMetadata: { contentType: file.type || 'image/jpeg' },
   });
 
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(key, new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.agent_photo', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Agent photo update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -2963,11 +3050,15 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
     if (event.agent_photo_2_key && event.agent_photo_2_key !== existingKey) {
       await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
     }
-    await c.env.DB.prepare(
-      'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+    try {
+      const stmt = c.env.DB.prepare(
+        'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
+      )
+        .bind(existingKey, new Date().toISOString(), adminToken);
+      await commitAudited(c, { action: 'admin.event.agent_photo_2', targetType: 'event', targetId: event.id }, [stmt]);
+    } catch (err) {
+      return auditedMutationError(c, err, 'Agent photo 2 update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -2988,11 +3079,15 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
     httpMetadata: { contentType: file.type || 'image/jpeg' },
   });
 
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(key, new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.agent_photo_2', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Agent photo 2 update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3015,11 +3110,15 @@ app.post('/admin/events/:adminToken/agent-photo/delete', async (c) => {
     await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
   }
 
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET agent_photo_key = NULL, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.agent_photo_delete', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Agent photo delete failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3038,11 +3137,15 @@ app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
     await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
   }
 
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_2_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET agent_photo_2_key = NULL, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.agent_photo_2_delete', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Agent photo 2 delete failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3068,11 +3171,15 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
     if (event.flyer_key && event.flyer_key !== existingKey) {
       await deleteR2FileIfUnreferenced(c, event.flyer_key);
     }
-    await c.env.DB.prepare(
-      'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
-    )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+    try {
+      const stmt = c.env.DB.prepare(
+        'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
+      )
+        .bind(existingKey, new Date().toISOString(), adminToken);
+      await commitAudited(c, { action: 'admin.event.flyer', targetType: 'event', targetId: event.id }, [stmt]);
+    } catch (err) {
+      return auditedMutationError(c, err, 'Flyer update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -3110,11 +3217,15 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
     httpMetadata: { contentType: safeContentType },
   });
 
-  await c.env.DB.prepare(
-    'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(key, new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.flyer', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Flyer update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3137,11 +3248,15 @@ app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
     await deleteR2FileIfUnreferenced(c, event.flyer_key);
   }
 
-  await c.env.DB.prepare(
-    'UPDATE events SET flyer_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET flyer_key = NULL, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.flyer_delete', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Flyer delete failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3183,11 +3298,15 @@ app.post('/admin/events/:adminToken/guests/:guestId/followup', async (c) => {
   const follow_up_status = (form.get('follow_up_status') as string | null)?.trim() ?? 'pending';
   const follow_up_notes = (form.get('follow_up_notes') as string | null)?.trim() || null;
 
-  await c.env.DB.prepare(
-    'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
-  )
-    .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
+    )
+      .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id);
+    await commitAudited(c, { action: 'admin.guest.followup', targetType: 'guest', targetId: guestId }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Follow-up update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3213,11 +3332,15 @@ app.post('/admin/events/:adminToken/status', async (c) => {
 
   if (!event) return c.notFound();
 
-  await c.env.DB.prepare(
-    'UPDATE events SET status = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(newStatus, new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET status = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(newStatus, new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.status', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Status update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3236,11 +3359,15 @@ app.post('/admin/events/:adminToken/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  await c.env.DB.prepare(
-    'UPDATE events SET deleted_at = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET deleted_at = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.delete', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Delete failed');
+  }
 
   return c.redirect('/admin?filter=deleted');
 });
@@ -3259,11 +3386,15 @@ app.post('/admin/events/:adminToken/restore', async (c) => {
 
   if (!event) return c.notFound();
 
-  await c.env.DB.prepare(
-    'UPDATE events SET deleted_at = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET deleted_at = NULL, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.restore', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Restore failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3295,7 +3426,12 @@ app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
     await deleteR2FileIfUnreferenced(c, event.flyer_key);
   }
 
-  await c.env.DB.prepare('DELETE FROM events WHERE id = ?').bind(event.id).run();
+  try {
+    const stmt = c.env.DB.prepare('DELETE FROM events WHERE id = ?').bind(event.id);
+    await commitAudited(c, { action: 'admin.event.permanent_delete', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Permanent delete failed');
+  }
 
   return c.redirect('/admin?filter=deleted');
 });
@@ -3320,38 +3456,43 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
   const newRsvpToken = generateToken(16);
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name,
-       description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key, agent_photo_2_key, flyer_key,
-       status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      newId,
-      // Strip existing "(Copy)" suffix to avoid "Event (Copy) (Copy) (Copy)..." stacking
-      `${source.title.replace(/\s*\(Copy\)\s*$/, '').trim()} (Copy)`,
-      source.property_address,
-      source.agent_name,
-      source.agent_email,
-      source.agent_phone,
-      source.company_name,
-      source.description,
-      source.start_time,
-      source.end_time,
-      source.timezone,
-      source.listing_url,
-      source.photo_key,
-      source.agent_photo_key,
-      source.agent_photo_2_key,
-      source.flyer_key,
-      newAdminToken,
-      newPublicToken,
-      newRsvpToken,
-      sessionTenant(c),
-      now,
-      now
+  try {
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name,
+         description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key, agent_photo_2_key, flyer_key,
+         status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
     )
-    .run();
+      .bind(
+        newId,
+        // Strip existing "(Copy)" suffix to avoid "Event (Copy) (Copy) (Copy)..." stacking
+        `${source.title.replace(/\s*\(Copy\)\s*$/, '').trim()} (Copy)`,
+        source.property_address,
+        source.agent_name,
+        source.agent_email,
+        source.agent_phone,
+        source.company_name,
+        source.description,
+        source.start_time,
+        source.end_time,
+        source.timezone,
+        source.listing_url,
+        source.photo_key,
+        source.agent_photo_key,
+        source.agent_photo_2_key,
+        source.flyer_key,
+        newAdminToken,
+        newPublicToken,
+        newRsvpToken,
+        sessionTenant(c),
+        now,
+        now
+      );
+
+    await commitAudited(c, { action: 'admin.event.duplicate', targetType: 'event', targetId: newId }, [insertStmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Duplicate failed');
+  }
 
   return c.redirect(`/admin/events/${newAdminToken}`);
 });
@@ -3711,11 +3852,15 @@ app.post('/agent/:adminToken/guests/:guestId/followup', async (c) => {
   const follow_up_status = (form.get('follow_up_status') as string | null)?.trim() ?? 'pending';
   const follow_up_notes = (form.get('follow_up_notes') as string | null)?.trim() || null;
 
-  await c.env.DB.prepare(
-    'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
-  )
-    .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
+    )
+      .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id);
+    await commitAudited(c, { action: 'admin.guest.followup', targetType: 'guest', targetId: guestId }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Follow-up update failed');
+  }
 
   return c.redirect(`/agent/${adminToken}`);
 });
@@ -3736,11 +3881,15 @@ app.post('/agent/:adminToken/guests/:guestId/checkin', async (c) => {
 
   if (!event) return c.notFound();
 
-  await c.env.DB.prepare(
-    'UPDATE guests SET checked_in = 1, checked_in_at = ? WHERE id = ? AND event_id = ?'
-  )
-    .bind(new Date().toISOString(), guestId, event.id)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE guests SET checked_in = 1, checked_in_at = ? WHERE id = ? AND event_id = ?'
+    )
+      .bind(new Date().toISOString(), guestId, event.id);
+    await commitAudited(c, { action: 'admin.guest.checkin', targetType: 'guest', targetId: guestId }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Check-in failed');
+  }
 
   return c.redirect(`/agent/${adminToken}`);
 });
@@ -3773,12 +3922,17 @@ app.post('/agent/:adminToken/guests/add', async (c) => {
   const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
-  )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now)
-    .run();
+  const guestId = generateId();
+  try {
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    )
+      .bind(guestId, event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now);
+    await commitAudited(c, { action: 'admin.guest.add', targetType: 'guest', targetId: guestId }, [insertStmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Add guest failed');
+  }
 
   return c.redirect(`/agent/${adminToken}`);
 });
@@ -3843,12 +3997,17 @@ app.post('/admin/events/:adminToken/guests/add', async (c) => {
   const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
-  )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now)
-    .run();
+  const guestId = generateId();
+  try {
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    )
+      .bind(guestId, event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now);
+    await commitAudited(c, { action: 'admin.guest.add', targetType: 'guest', targetId: guestId }, [insertStmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Add guest failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });

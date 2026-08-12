@@ -43,6 +43,10 @@ interface StatementRunner {
   first: <T>() => Promise<T | null>;
 }
 
+// A bound statement remembers its underlying node:sqlite statement + args so
+// batch() can execute it inside a single BEGIN/COMMIT transaction.
+type BoundRunner = StatementRunner & { __stmt: unknown; __args: unknown[] };
+
 export class SqliteD1 {
   private db: DatabaseSync;
 
@@ -70,7 +74,7 @@ export class SqliteD1 {
     first: <T>() => Promise<T | null>;
   } {
     const stmt = this.db.prepare(sql);
-    const makeRunner = (args: unknown[]): StatementRunner => ({
+    const makeRunner = (args: unknown[]): BoundRunner => ({
       run: async () => {
         stmt.run(...args);
         return { success: true, meta: {} };
@@ -83,6 +87,8 @@ export class SqliteD1 {
         const row = stmt.get(...args) as unknown as T | undefined;
         return row ?? null;
       },
+      __stmt: stmt,
+      __args: args,
     });
     const direct = makeRunner([]);
     return {
@@ -91,6 +97,34 @@ export class SqliteD1 {
       all: direct.all,
       first: direct.first,
     };
+  }
+
+  /**
+   * Execute statements atomically in a single transaction. Mirrors the D1
+   * semantics the Worker relies on for audited mutations: if any statement
+   * fails, the transaction is rolled back and the error is rethrown so no
+   * partial data change survives.
+   */
+  async batch(statements: StatementRunner[]): Promise<D1Result[]> {
+    this.db.exec('BEGIN');
+    try {
+      const results: D1Result[] = [];
+      for (const stmt of statements as BoundRunner[]) {
+        const runner = stmt.__stmt
+          ? (() => {
+              const s = stmt.__stmt as { run: (...a: unknown[]) => unknown };
+              s.run(...stmt.__args);
+              return { success: true, meta: {} };
+            })()
+          : await stmt.run();
+        results.push(runner);
+      }
+      this.db.exec('COMMIT');
+      return results;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   /** Convenience raw queries for assertions. */

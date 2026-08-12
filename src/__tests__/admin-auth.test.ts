@@ -121,13 +121,14 @@ describe('admin authentication (containment opt-out for tests)', () => {
     expect(html).toContain('csrf-token');
   });
 
-  it('records an audit row for a denied authentication attempt', async () => {
+  it('logs a denied authentication attempt but persists no admin_audit row', async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => logs.push(line));
     await request('/admin', env, { method: 'POST' });
-    const rows = db.query<{ action: string; outcome: string }>(
-      "SELECT action, outcome FROM admin_audit WHERE action = 'admin.auth'"
-    );
-    expect(rows.length).toBeGreaterThan(0);
-    expect(rows[0].outcome).toBe('denied');
+    const serialized = logs.join('\n');
+    expect(serialized).toContain('admin.auth.denied');
+    const rows = db.query("SELECT * FROM admin_audit WHERE action = 'admin.auth'");
+    expect(rows).toHaveLength(0);
   });
 
   it('never logs the rejected session token', async () => {
