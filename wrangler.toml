@@ -23,6 +23,10 @@ custom_domain = true
 [vars]
 APP_URL = "https://openhouse.primeamericarealestate.com"
 WORKSPACE_URL = "https://workspace.primeamericany.com"
+# Server-side tenant assignment for legacy direct-login / first-run setup
+# sessions. Trusted config, never client-supplied. Direct login without this
+# produces a session with no tenant, which fails closed at every admin gate.
+ADMIN_TENANT_ID = "tenant_primeamerica"
 
 [observability]
 enabled = true

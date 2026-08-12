@@ -29,6 +29,7 @@ async function makeEnv(db: SqliteD1, containment: boolean): Promise<Record<strin
     BUCKET: {} as unknown as R2Bucket,
     APP_URL: ORIGIN,
     WORKSPACE_URL: WORKSPACE,
+    ADMIN_TENANT_ID: 'tenant_primeamerica',
     CONTAINMENT_ENABLED: containment ? 'false' : undefined,
   };
 }
@@ -48,7 +49,7 @@ function cookieFrom(res: Response, name: string): string | null {
 }
 
 async function sessionToken(db: SqliteD1, userId = 'admin_1'): Promise<string> {
-  return createSession(db as unknown as D1Database, { userId, role: 'admin', userEmail: 'admin@example.com' });
+  return createSession(db as unknown as D1Database, { userId, role: 'admin', userEmail: 'admin@example.com', tenantId: 'tenant_primeamerica' });
 }
 
 async function csrfOf(db: SqliteD1): Promise<string> {
@@ -136,6 +137,74 @@ describe('admin authentication (containment opt-out for tests)', () => {
     const serialized = logs.join('\n');
     expect(serialized).not.toContain('supersecrettokenvalue');
     expect(serialized).not.toContain('oh_session');
+  });
+});
+
+describe('fail-closed tenant + legacy cookie removal', () => {
+  let db: SqliteD1;
+  let env: Record<string, unknown>;
+
+  beforeEach(async () => {
+    db = makeDb();
+    env = await makeEnv(db, true);
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('rejects a valid session that has no tenant ID (fail closed, no default fallback)', async () => {
+    const token = await createSession(db as unknown as D1Database, { userId: 'admin_1', role: 'admin', userEmail: 'admin@example.com' });
+    const res = await request('/admin', env, { headers: { Cookie: `oh_session=${token}`, Accept: 'text/html' } });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('rejects non-HTML requests from a session with no tenant ID with 403', async () => {
+    const token = await createSession(db as unknown as D1Database, { userId: 'admin_1', role: 'admin', userEmail: 'admin@example.com' });
+    const res = await request('/admin/events', env, { headers: { Cookie: `oh_session=${token}` } });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { success: boolean };
+    expect(body.success).toBe(false);
+  });
+
+  it('ignores a forged openhouse_user cookie: no session means no identity', async () => {
+    const forged = encodeURIComponent(JSON.stringify({ id: 'admin_1', email: 'admin@example.com', role: 'admin', name: 'Admin One' }));
+    const res = await request('/admin', env, { headers: { Cookie: `openhouse_user=${forged}`, Accept: 'text/html' } });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')?.startsWith(`${WORKSPACE}/api/sso/redirect`)).toBe(true);
+  });
+
+  it('ignores a forged openhouse_user cookie claiming a tenant even with a valid session', async () => {
+    const token = await sessionToken(db);
+    const forged = encodeURIComponent(JSON.stringify({ id: 'admin_1', email: 'admin@example.com', role: 'admin', name: 'Admin One' }));
+    const res = await request('/admin', env, { headers: { Cookie: `oh_session=${token}; openhouse_user=${forged}`, Accept: 'text/html' } });
+    expect(res.status).toBe(200);
+  });
+
+  it('direct login derives tenant from server-side ADMIN_TENANT_ID, never from the form', async () => {
+    const res = await request('/login', env, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+      body: 'username=admin@example.com&password=secret-password&tenant_id=evil-tenant',
+    });
+    expect(res.status).toBe(302);
+    const row = db.queryOne<{ tenant_id: string | null }>('SELECT tenant_id FROM admin_sessions ORDER BY created_at DESC LIMIT 1');
+    expect(row!.tenant_id).toBe('tenant_primeamerica');
+  });
+
+  it('direct login without ADMIN_TENANT_ID configured creates a no-tenant session that fails closed', async () => {
+    const bareDb = makeDb();
+    const bare = await makeEnv(bareDb, true);
+    delete (bare as Record<string, unknown>).ADMIN_TENANT_ID;
+    const res = await request('/login', bare, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+      body: 'username=admin@example.com&password=secret-password',
+    });
+    expect(res.status).toBe(302);
+    const cookie = cookieFrom(res, 'oh_session');
+    const dash = await request('/admin', bare, { headers: { Cookie: `oh_session=${cookie}`, Accept: 'text/html' } });
+    expect(dash.status).toBe(302);
+    expect(dash.headers.get('location')).toBe('/login');
   });
 });
 

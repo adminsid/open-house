@@ -11,6 +11,7 @@ export type LogEvent =
   | 'admin.auth.success'
   | 'admin.auth.failure'
   | 'admin.auth.denied'
+  | 'admin.tenant.denied'
   | 'admin.csrf.denied'
   | 'admin.authz.denied'
   | 'audit.record'

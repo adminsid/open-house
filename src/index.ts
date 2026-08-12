@@ -17,6 +17,12 @@ type Bindings = {
   APP_URL: string;
   WORKSPACE_URL?: string;
   INTERNAL_API_SECRET?: string;
+  // Server-side configuration for the single-tenant deployment: the tenant
+  // ID assigned to legacy direct-login / first-run setup sessions. Trusted
+  // server configuration — never derived from client input. Direct login
+  // without this configured creates a session with NO tenant, which then
+  // fails closed at every admin gate.
+  ADMIN_TENANT_ID?: string;
   // Emergency-containment reopen switch. Only ever set to 'false' in local
   // test/CI environments; deployed configs must leave it unset so /admin
   // stays behind the 503 guard until the auth fix is fully verified.
@@ -100,34 +106,45 @@ function generateToken(byteLength: number = 16): string {
 }
 
 function getUserSession(c: any): { id?: string; email?: string; name?: string; role?: string } | null {
-  // Admin routes set a validated server-side session via the auth middleware;
-  // its trusted identity (captured at SSO validation time) takes precedence.
+  // Identity is taken ONLY from the validated server-side session (captured
+  // at SSO validation time). The legacy unsigned openhouse_user cookie is
+  // never trusted for identity, role, or assignment decisions.
   const session = c.get('session') as Session | undefined;
-  if (session) {
-    return {
-      id: session.userId,
-      email: session.userEmail ?? undefined,
-      name: session.userName ?? undefined,
-      role: session.role ?? undefined,
-    };
-  }
-  const cookie = getCookie(c, 'openhouse_user');
-  if (!cookie) return null;
-  try {
-    return JSON.parse(decodeURIComponent(cookie));
-  } catch {
-    return null;
-  }
+  if (!session) return null;
+  return {
+    id: session.userId,
+    email: session.userEmail ?? undefined,
+    name: session.userName ?? undefined,
+    role: session.role ?? undefined,
+  };
 }
 
 function isUserAssignedToEvent(user: { email?: string; name?: string; role?: string } | null, ev: Event): boolean {
-  if (!user) return true; // fallback for direct admin login
+  if (!user) return false; // fail closed: no trusted identity, no assignment
   if (user.role === 'admin' || user.role === 'broker') return true;
   const userEmail = (user.email || '').toLowerCase().trim();
   const userName = (user.name || '').toLowerCase().trim();
   const evEmail = (ev.agent_email || '').toLowerCase().trim();
   const evName = (ev.agent_name || '').toLowerCase().trim();
   return Boolean((userEmail && evEmail && userEmail === evEmail) || (userName && evName && userName === evName));
+}
+
+/** Raised when a request lacks a validated tenant (fail-closed authorization). */
+export class AuthError extends Error {}
+
+/**
+ * The tenant for the current ADMIN request, taken from the validated
+ * server-side session only — never from client input and never from a
+ * default. Throws AuthError when the request has no validated session or the
+ * session carries no tenant ID. Admin routes are pre-gated by
+ * adminRequireTenant so this is defense-in-depth, not the primary check.
+ */
+function sessionTenant(c: any): string {
+  const session = c.get('session') as Session | undefined;
+  if (!session?.tenantId) {
+    throw new AuthError('No validated server-side tenant for request');
+  }
+  return session.tenantId;
 }
 
 async function hashPassword(password: string): Promise<string> {
@@ -613,6 +630,27 @@ async function adminRequireCsrf(c: any, next: any): Promise<Response | void> {
   return await next();
 }
 
+// Fail-closed tenant gate. Every admin request must carry a validated
+// server-side session that includes a tenant ID; otherwise the request is
+// rejected outright (no default-tenant fallback).
+async function adminRequireTenant(c: any, next: any): Promise<Response | void> {
+  const session = c.get('session') as Session | undefined;
+  if (!session?.tenantId) {
+    emitLog({
+      event: 'admin.tenant.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    if (c.req.method === 'GET' && (c.req.header('accept') || '').includes('text/html')) {
+      return c.redirect('/login');
+    }
+    return c.json({ success: false, error: 'Forbidden: no validated tenant' }, 403);
+  }
+  return await next();
+}
+
 // Inject the session-bound CSRF token into admin HTML pages so their forms
 // and fetch calls carry _csrf / X-CSRF-Token automatically.
 async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
@@ -658,8 +696,8 @@ async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
   c.res = new Response(injected, c.res);
 }
 
-app.use('/admin', adminRequireAuth, adminRequireCsrf, adminInjectCsrf);
-app.use('/admin/*', adminRequireAuth, adminRequireCsrf, adminInjectCsrf);
+app.use('/admin', adminRequireAuth, adminRequireTenant, adminRequireCsrf, adminInjectCsrf);
+app.use('/admin/*', adminRequireAuth, adminRequireTenant, adminRequireCsrf, adminInjectCsrf);
 
 app.get('/', (c) => c.redirect('/admin'));
 
@@ -739,6 +777,7 @@ app.post('/setup', async (c) => {
     role: 'admin',
     userEmail: username,
     userName: name,
+    tenantId: (c.env.ADMIN_TENANT_ID as string | undefined) ?? null,
   });
   setCookie(c, SESSION_COOKIE, sessionToken, {
     path: '/',
@@ -812,6 +851,7 @@ app.post('/login', async (c) => {
       role: 'admin',
       userEmail: admin.username,
       userName: admin.name,
+      tenantId: (c.env.ADMIN_TENANT_ID as string | undefined) ?? null,
     });
     setCookie(c, SESSION_COOKIE, sessionToken, {
       path: '/',
@@ -1263,8 +1303,10 @@ app.get('/admin', async (c) => {
   if (filter === 'deleted') {
     // Trash tab: soft-deleted events
     const trashedEvents = await c.env.DB.prepare(
-      'SELECT * FROM events WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
-    ).all<Event>();
+      'SELECT * FROM events WHERE deleted_at IS NOT NULL AND tenant_id = ? ORDER BY deleted_at DESC'
+    )
+      .bind(sessionTenant(c))
+      .all<Event>();
 
     const trashedCards = (trashedEvents.results ?? [])
       .map((ev) => {
@@ -1339,12 +1381,16 @@ function filterEvents(q) {
 
   // Normal tabs: exclude soft-deleted events
   const eventsResult = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE deleted_at IS NULL ORDER BY start_time DESC'
-  ).all<Event>();
+    'SELECT * FROM events WHERE deleted_at IS NULL AND tenant_id = ? ORDER BY start_time DESC'
+  )
+    .bind(sessionTenant(c))
+    .all<Event>();
 
   const deletedCountResult = await c.env.DB.prepare(
-    'SELECT COUNT(*) as cnt FROM events WHERE deleted_at IS NOT NULL'
-  ).first<{ cnt: number }>();
+    'SELECT COUNT(*) as cnt FROM events WHERE deleted_at IS NOT NULL AND tenant_id = ?'
+  )
+    .bind(sessionTenant(c))
+    .first<{ cnt: number }>();
   const deletedCount = deletedCountResult?.cnt ?? 0;
 
   const allEvents = (eventsResult.results ?? []).map((ev) => ({
@@ -1647,8 +1693,10 @@ app.get('/admin/storage', async (c) => {
   const percentage = Math.min(100, (totalSize / limitBytes) * 100);
 
   const events = await c.env.DB.prepare(
-    'SELECT id, title, admin_token, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events'
-  ).all<Event>();
+    'SELECT id, title, admin_token, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events WHERE tenant_id = ?'
+  )
+    .bind(sessionTenant(c))
+    .all<Event>();
   
   const refMap = new Map<string, { eventTitle: string; role: string; adminToken: string }>();
   for (const ev of events.results ?? []) {
@@ -2088,10 +2136,10 @@ app.post('/admin/events/new', async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
+      `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
     )
-      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token, rsvp_token, now, now)
+      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token, rsvp_token, sessionTenant(c), now, now)
       .run();
 
     return c.redirect(`/admin/events/${admin_token}`);
@@ -2120,9 +2168,9 @@ app.post('/admin/events/new', async (c) => {
 app.get('/admin/events/:adminToken', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE admin_token = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Event>();
 
   if (!event) {
@@ -2717,9 +2765,9 @@ function toggleAgent2(checked) {
 app.post('/admin/events/:adminToken/update', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
@@ -2764,9 +2812,9 @@ app.post('/admin/events/:adminToken/update', async (c) => {
 app.post('/admin/events/:adminToken/photo', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'photo_key'>>();
 
   if (!event) return c.notFound();
@@ -2819,9 +2867,9 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
 app.post('/admin/events/:adminToken/photo/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'photo_key'>>();
 
   if (!event) return c.notFound();
@@ -2846,9 +2894,9 @@ app.post('/admin/events/:adminToken/photo/delete', async (c) => {
 app.post('/admin/events/:adminToken/agent-photo', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_key'>>();
 
   if (!event) return c.notFound();
@@ -2901,9 +2949,9 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
 app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_2_key'>>();
 
   if (!event) return c.notFound();
@@ -2956,9 +3004,9 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
 app.post('/admin/events/:adminToken/agent-photo/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_key'>>();
 
   if (!event) return c.notFound();
@@ -2979,9 +3027,9 @@ app.post('/admin/events/:adminToken/agent-photo/delete', async (c) => {
 app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_2_key'>>();
 
   if (!event) return c.notFound();
@@ -3006,9 +3054,9 @@ app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
 app.post('/admin/events/:adminToken/flyer', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, flyer_key FROM events WHERE admin_token = ?'
+    'SELECT id, flyer_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
@@ -3078,9 +3126,9 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
 app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, flyer_key FROM events WHERE admin_token = ?'
+    'SELECT id, flyer_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
@@ -3124,9 +3172,9 @@ app.post('/admin/events/:adminToken/guests/:guestId/followup', async (c) => {
   const guestId = c.req.param('guestId');
 
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
@@ -3157,6 +3205,14 @@ app.post('/admin/events/:adminToken/status', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
+  )
+    .bind(adminToken, sessionTenant(c))
+    .first<Pick<Event, 'id'>>();
+
+  if (!event) return c.notFound();
+
   await c.env.DB.prepare(
     'UPDATE events SET status = ?, updated_at = ? WHERE admin_token = ?'
   )
@@ -3173,9 +3229,9 @@ app.post('/admin/events/:adminToken/status', async (c) => {
 app.post('/admin/events/:adminToken/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
@@ -3196,9 +3252,9 @@ app.post('/admin/events/:adminToken/delete', async (c) => {
 app.post('/admin/events/:adminToken/restore', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
@@ -3219,9 +3275,9 @@ app.post('/admin/events/:adminToken/restore', async (c) => {
 app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events WHERE admin_token = ?'
+    'SELECT id, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'photo_key' | 'agent_photo_key' | 'agent_photo_2_key' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
@@ -3251,9 +3307,9 @@ app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
 app.post('/admin/events/:adminToken/duplicate', async (c) => {
   const adminToken = c.req.param('adminToken');
   const source = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE admin_token = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Event>();
 
   if (!source) return c.notFound();
@@ -3267,8 +3323,8 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
   await c.env.DB.prepare(
     `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name,
        description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key, agent_photo_2_key, flyer_key,
-       status, admin_token, public_token, rsvp_token, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
+       status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       newId,
@@ -3291,6 +3347,7 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
       newAdminToken,
       newPublicToken,
       newRsvpToken,
+      sessionTenant(c),
       now,
       now
     )
@@ -3306,9 +3363,9 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
 app.get('/admin/events/:adminToken/qr', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT public_token FROM events WHERE admin_token = ?'
+    'SELECT public_token FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'public_token'>>();
 
   if (!event) return c.notFound();
@@ -3766,9 +3823,9 @@ app.post('/admin/events/:adminToken/guests/add', async (c) => {
   const adminToken = c.req.param('adminToken');
 
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
@@ -3804,9 +3861,9 @@ app.get('/admin/events/:adminToken/export.csv', async (c) => {
   const adminToken = c.req.param('adminToken');
 
   const event = await c.env.DB.prepare(
-    'SELECT id, title, timezone FROM events WHERE admin_token = ?'
+    'SELECT id, title, timezone FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'title' | 'timezone'>>();
 
   if (!event) return c.notFound();
@@ -4130,9 +4187,9 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
 app.get('/admin/events/:adminToken/signin-sheet', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE admin_token = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Event>();
 
   if (!event) return c.notFound();
