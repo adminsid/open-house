@@ -3548,6 +3548,22 @@ app.get('/admin/events/:adminToken/qr', async (c) => {
 // Agent view  (GET /agent/:adminToken)
 // ---------------------------------------------------------------------------
 
+// Compromised agent-token containment (launch blocker): the event admin_token
+// was exposed in the prior incident. EVERY method and path under /agent/*
+// returns a generic 503 until a separate token-rotation + scoped
+// agent-capability release completes. We do NOT parse, validate, log, render,
+// or redirect based on the token, and we never reveal whether a token is valid.
+app.use('/agent/*', async () => {
+  return new Response('Agent access is temporarily unavailable', {
+    status: 503,
+    headers: {
+      'Cache-Control': 'no-store',
+      'Retry-After': '3600',
+      'Content-Type': 'text/plain; charset=utf-8',
+    },
+  });
+});
+
 app.get('/agent/:adminToken', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
