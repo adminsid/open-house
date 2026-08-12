@@ -25,7 +25,7 @@ import { AUDIT_SQL } from './audit';
 import type { AuditRecord } from './audit';
 
 export type MediaOpAction = 'apply_upload' | 'delete';
-export type MediaOpStatus = 'pending' | 'processing' | 'done' | 'failed';
+export type MediaOpStatus = 'pending' | 'processing' | 'done' | 'failed' | 'superseded';
 
 export interface MediaOpInput {
   action: MediaOpAction;
@@ -34,6 +34,12 @@ export interface MediaOpInput {
   targetType?: string | null;
   targetEventId?: string | null;
   targetColumn?: string | null;
+  /** The event field's value at operation creation (optimistic concurrency baseline). */
+  expectedRef?: string | null;
+  /** The event field value this operation intends to set. */
+  intendedRef?: string | null;
+  /** Dedupes duplicate submissions; persisted on the seq-0 op only. */
+  idempotencyKey?: string | null;
   tenantId?: string | null;
   auditAction: string;
   actorId?: string | null;
@@ -60,6 +66,9 @@ export interface MediaOpRecord {
   attempts: number;
   errorCode: string | null;
   claimId: string | null;
+  expectedRef: string | null;
+  intendedRef: string | null;
+  idempotencyKey: string | null;
   createdAt: string;
 }
 
@@ -101,6 +110,9 @@ interface MediaOpRow {
   attempts: number;
   error_code: string | null;
   claim_id: string | null;
+  expected_ref: string | null;
+  intended_ref: string | null;
+  idempotency_key: string | null;
   created_at: string;
 }
 
@@ -124,6 +136,9 @@ function rowToOp(row: MediaOpRow): MediaOpRecord {
     attempts: row.attempts,
     errorCode: row.error_code,
     claimId: row.claim_id,
+    expectedRef: row.expected_ref,
+    intendedRef: row.intended_ref,
+    idempotencyKey: row.idempotency_key,
     createdAt: row.created_at,
   };
 }
@@ -132,9 +147,10 @@ async function buildOpInsert(db: D1Database, groupId: string, seq: number, input
   return db
     .prepare(
       `INSERT INTO media_ops
-         (id, group_id, seq, action, key, staging_key, target_type, target_event_id, target_column, tenant_id,
-          audit_action, actor_id, actor_email_hash, request_id, status, attempts, error_code, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`
+         (id, group_id, seq, action, key, staging_key, target_type, target_event_id, target_column,
+          expected_ref, intended_ref, idempotency_key, tenant_id, audit_action, actor_id, actor_email_hash,
+          request_id, status, attempts, error_code, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`
     )
     .bind(
       generateId(),
@@ -146,6 +162,9 @@ async function buildOpInsert(db: D1Database, groupId: string, seq: number, input
       input.targetType ?? null,
       input.targetEventId ?? null,
       input.targetColumn ?? null,
+      input.expectedRef ?? null,
+      input.intendedRef ?? null,
+      seq === 0 ? input.idempotencyKey ?? null : null,
       input.tenantId ?? null,
       input.auditAction,
       input.actorId ?? null,
@@ -168,11 +187,44 @@ async function buildOpInserts(db: D1Database, ops: MediaOpInput[], groupId: stri
  * Enqueue ops in their own batch (no data change yet). Returns the group id.
  * Used by uploads whose event-column + audit changes are applied at finalize.
  */
-export async function enqueueMediaOps(db: D1Database, ops: MediaOpInput[]): Promise<string> {
+/** Look up the group already created for an idempotency key (duplicate submission). */
+export async function findMediaGroupByKey(db: D1Database, idempotencyKey: string): Promise<string | null> {
+  const row = await db
+    .prepare('SELECT group_id FROM media_ops WHERE idempotency_key = ? LIMIT 1')
+    .bind(idempotencyKey)
+    .first<{ group_id: string }>();
+  return row?.group_id ?? null;
+}
+
+async function tryEnqueue(db: D1Database, stmts: D1PreparedStatement[], groupId: string, idempotencyKey?: string | null): Promise<string> {
+  try {
+    await db.batch(stmts);
+    return groupId;
+  } catch (err) {
+    // A concurrent duplicate may have won the idempotency-key race (unique
+    // index on seq-0). Reuse that group instead of creating a competing op.
+    if (idempotencyKey) {
+      const existing = await findMediaGroupByKey(db, idempotencyKey);
+      if (existing) return existing;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Enqueue ops in their own batch (no data change yet). Returns the group id.
+ * Used by uploads whose event-column + audit changes are applied at finalize.
+ * If an idempotencyKey is given and a group already exists for it, the existing
+ * group is returned (dedup; never a competing operation).
+ */
+export async function enqueueMediaOps(db: D1Database, ops: MediaOpInput[], idempotencyKey?: string | null): Promise<string> {
+  if (idempotencyKey) {
+    const existing = await findMediaGroupByKey(db, idempotencyKey);
+    if (existing) return existing;
+  }
   const groupId = generateId();
   const stmts = await buildOpInserts(db, ops, groupId);
-  await db.batch(stmts);
-  return groupId;
+  return await tryEnqueue(db, stmts, groupId, idempotencyKey);
 }
 
 /**
@@ -180,13 +232,20 @@ export async function enqueueMediaOps(db: D1Database, ops: MediaOpInput[]): Prom
  * of [dataStmts..., auditStmt, opInserts...]. If any statement fails the whole
  * batch rolls back and nothing changes. Used by delete-style routes where the
  * DB reference clear and the outbox delete record must commit together.
+ * If an idempotencyKey is given and a group already exists for it, the existing
+ * group is returned (dedup; the duplicate submission does not re-apply).
  */
 export async function enqueueMediaOpsAtomic(
   db: D1Database,
   dataStmts: D1PreparedStatement[],
   auditRecord: AuditRecord,
-  ops: MediaOpInput[]
+  ops: MediaOpInput[],
+  idempotencyKey?: string | null
 ): Promise<string> {
+  if (idempotencyKey) {
+    const existing = await findMediaGroupByKey(db, idempotencyKey);
+    if (existing) return existing;
+  }
   const groupId = generateId();
   const opStmts = await buildOpInserts(db, ops, groupId);
   const auditStmt = db.prepare(AUDIT_SQL).bind(
@@ -200,8 +259,7 @@ export async function enqueueMediaOpsAtomic(
     auditRecord.outcome,
     auditRecord.requestId ?? null
   );
-  await db.batch([...dataStmts, auditStmt, ...opStmts]);
-  return groupId;
+  return await tryEnqueue(db, [...dataStmts, auditStmt, ...opStmts], groupId, idempotencyKey);
 }
 
 async function loadOp(db: D1Database, opId: string): Promise<MediaOpRecord | null> {
@@ -277,12 +335,40 @@ async function runDelete(env: { BUCKET: R2Bucket }, db: D1Database, op: MediaOpR
   }
 }
 
-/** Execute one apply_upload op: ensure final object, then point ref + audit atomically. Idempotent. */
+/** Execute one apply_upload op: guarded apply, then point ref + audit atomically. Idempotent. */
 async function runApplyUpload(env: { BUCKET: R2Bucket }, db: D1Database, op: MediaOpRecord): Promise<boolean> {
   try {
     if (!SAFE_COLUMNS.includes(op.targetColumn as (typeof SAFE_COLUMNS)[number])) {
       return await attemptFailed(db, op, 'INVALID_TARGET');
     }
+    const col = op.targetColumn as (typeof SAFE_COLUMNS)[number];
+
+    // Read the current field value to decide apply vs already-applied vs superseded.
+    const current = await db
+      .prepare(`SELECT ${col} AS v FROM events WHERE id = ? AND tenant_id = ?`)
+      .bind(op.targetEventId, op.tenantId)
+      .first<{ v: string | null }>();
+    if (current === null || current === undefined) {
+      return await attemptFailed(db, op, 'TARGET_MISSING');
+    }
+
+    if (current.v === op.intendedRef) {
+      // Already applied by an earlier attempt (e.g. the finalize batch failed
+      // after the guarded UPDATE). Ensure audit + done exist, then clean staging.
+      await db.batch([auditStmt(db, op), db.prepare('UPDATE media_ops SET status = ?, updated_at = ? WHERE id = ?').bind('done', now(), op.id)]);
+      await cleanupStaging(env, db, op);
+      return true;
+    }
+
+    if (current.v !== op.expectedRef) {
+      // The field no longer equals this operation's expected prior reference:
+      // a newer operation won. Never overwrite it and never write an
+      // audit-success record.
+      return await markSuperseded(env, db, op);
+    }
+
+    // Field still equals expectedRef: apply. The guarded UPDATE is the atomic
+    // verify-and-set — it can only match the expected reference.
     const finalExists = await env.BUCKET.get(op.key);
     if (!finalExists) {
       if (!op.stagingKey) {
@@ -298,37 +384,71 @@ async function runApplyUpload(env: { BUCKET: R2Bucket }, db: D1Database, op: Med
       });
     }
 
-    const auditStmt = db.prepare(AUDIT_SQL).bind(
-      generateId(),
-      op.actorId,
-      op.actorEmailHash,
-      op.tenantId,
-      op.auditAction,
-      op.targetType ?? null,
-      op.targetEventId ?? null,
-      'success',
-      op.requestId
-    );
-
-    await db.batch([
-      db
-        .prepare(`UPDATE events SET ${op.targetColumn} = ? WHERE id = ? AND tenant_id = ?`)
-        .bind(op.key, op.targetEventId, op.tenantId),
-      auditStmt,
-      db.prepare('UPDATE media_ops SET status = ?, updated_at = ? WHERE id = ?').bind('done', now(), op.id),
-    ]);
-
-    if (op.stagingKey) {
-      try {
-        await env.BUCKET.delete(op.stagingKey);
-      } catch {
-        await recordErrorCode(db, op.id, 'STAGING_CLEANUP_PENDING');
-      }
+    const applyResult = await db
+      .prepare(`UPDATE events SET ${col} = ? WHERE id = ? AND tenant_id = ? AND ${col} IS ?`)
+      .bind(op.intendedRef, op.targetEventId, op.tenantId, op.expectedRef)
+      .run();
+    const changes = Number((applyResult.meta as { changes?: unknown } | undefined)?.changes ?? 0);
+    if (changes !== 1) {
+      // Raced between the SELECT and the guarded UPDATE: a concurrent
+      // operation changed the field. Treat as superseded.
+      return await markSuperseded(env, db, op);
     }
+
+    await db.batch([auditStmt(db, op), db.prepare('UPDATE media_ops SET status = ?, updated_at = ? WHERE id = ?').bind('done', now(), op.id)]);
+    await cleanupStaging(env, db, op);
     return true;
   } catch {
     return await attemptFailed(db, op, 'MEDIA_APPLY_FAILED');
   }
+}
+
+function auditStmt(db: D1Database, op: MediaOpRecord): D1PreparedStatement {
+  return db.prepare(AUDIT_SQL).bind(
+    generateId(),
+    op.actorId,
+    op.actorEmailHash,
+    op.tenantId,
+    op.auditAction,
+    op.targetType ?? null,
+    op.targetEventId ?? null,
+    'success',
+    op.requestId
+  );
+}
+
+/** Best-effort staging cleanup after a successful apply; failures are recorded, never fatal. */
+async function cleanupStaging(env: { BUCKET: R2Bucket }, db: D1Database, op: MediaOpRecord): Promise<void> {
+  if (!op.stagingKey) return;
+  try {
+    await env.BUCKET.delete(op.stagingKey);
+  } catch {
+    await recordErrorCode(db, op.id, 'STAGING_CLEANUP_PENDING');
+  }
+}
+
+/**
+ * Mark an op superseded: terminal, never applied, never audited as success.
+ * Owned objects (staging key, and the final key if a prior attempt created it)
+ * are cleaned up via the outbox under refcount protection, so cleanup can never
+ * delete an object that a newer operation references.
+ */
+async function markSuperseded(env: { BUCKET: R2Bucket }, db: D1Database, op: MediaOpRecord): Promise<boolean> {
+  await setStatus(db, op.id, 'superseded', op.attempts, 'SUPERSEDED');
+  const cleanupOps: MediaOpInput[] = [];
+  if (op.stagingKey) {
+    cleanupOps.push({ action: 'delete', key: op.stagingKey, targetType: 'event', tenantId: op.tenantId, auditAction: 'media.cleanup', requestId: op.requestId });
+  }
+  if (op.key) {
+    cleanupOps.push({ action: 'delete', key: op.key, targetType: 'event', tenantId: op.tenantId, auditAction: 'media.cleanup', requestId: op.requestId });
+  }
+  if (cleanupOps.length > 0) {
+    const groupId = await enqueueMediaOps(db, cleanupOps).catch(() => null);
+    if (groupId) {
+      await executeMediaGroup(env, db, groupId).catch(() => {});
+    }
+  }
+  return false;
 }
 
 async function runOp(env: { BUCKET: R2Bucket }, db: D1Database, op: MediaOpRecord): Promise<boolean> {
@@ -382,13 +502,14 @@ export async function executeMediaGroup(
   const claimId = generateId();
   for (const op of ops) {
     if (op.status === 'done') continue;
+    if (op.status === 'superseded') continue; // terminal; never re-runs
     if (op.status === 'processing') return false; // claimed by another runner
     if (op.status === 'failed') return false; // blocked; operator retries
     if (!(await claimOp(db, op.id, claimId))) {
       // Lost the claim: another runner owns the op now (processing) or it just
-      // completed. Re-read to decide.
+      // completed / was superseded. Re-read to decide.
       const fresh = await loadOp(db, op.id);
-      if (fresh?.status === 'done') continue;
+      if (fresh?.status === 'done' || fresh?.status === 'superseded') continue;
       return false;
     }
     const ran = await runOp(env, db, op);
@@ -399,13 +520,14 @@ export async function executeMediaGroup(
 
 export type RetryResult = {
   ok: boolean;
-  status: 'done' | 'claimed' | 'in_progress' | 'not_found' | 'failed';
+  status: 'done' | 'claimed' | 'superseded' | 'in_progress' | 'not_found' | 'failed';
   groupId: string | null;
 };
 
 /**
  * Operator retry. Idempotent and concurrency-safe:
  *   - a 'done' op is a no-op (never re-applied, no duplicate audit);
+ *   - a 'superseded' op is a no-op (a newer operation won);
  *   - a 'processing' op is reported as in_progress (another runner owns it);
  *   - a 'pending'/'failed' op is claimed and its whole group re-executed.
  */
@@ -417,6 +539,7 @@ export async function retryMediaOp(
   const op = await loadOp(db, opId);
   if (!op) return { ok: false, status: 'not_found', groupId: null };
   if (op.status === 'done') return { ok: true, status: 'done', groupId: op.groupId };
+  if (op.status === 'superseded') return { ok: true, status: 'superseded', groupId: op.groupId };
   if (op.status === 'processing') return { ok: false, status: 'in_progress', groupId: op.groupId };
   const ok = await executeMediaGroup(env, db, op.groupId);
   return { ok, status: ok ? 'claimed' : 'failed', groupId: op.groupId };

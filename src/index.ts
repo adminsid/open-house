@@ -12,6 +12,7 @@ import {
   retryMediaOp,
   listMediaOps,
   getMediaOp,
+  findMediaGroupByKey,
   SAFE_COLUMNS,
   type MediaOpInput,
 } from './lib/media-ops';
@@ -222,12 +223,33 @@ function requireMediaRole(c: any): boolean {
   return Boolean(session && (session.role === 'admin' || session.role === 'broker'));
 }
 
+/** Idempotency key for duplicate-submission dedup: X-Idempotency-Key header or _idem form field. */
+async function idempotencyKeyOf(c: any, form?: FormData): Promise<string | null> {
+  const header = c.req.header('x-idempotency-key');
+  if (typeof header === 'string' && header.length > 0 && header.length <= 200) return header;
+  const contentType = c.req.header('content-type') || '';
+  if (form) {
+    const f = form.get('_idem');
+    if (typeof f === 'string' && f.length > 0 && f.length <= 200) return f;
+  } else if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
+    try {
+      const f = await c.req.formData();
+      const v = f.get('_idem');
+      if (typeof v === 'string' && v.length > 0 && v.length <= 200) return v;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
  * Upload a media object via the durable outbox: stage the body under a unique
  * staging key, then apply_upload (copy to final key + point the event column +
- * audit atomically). The final key and any replaced old key are handed to the
- * executor as one idempotent, retryable group. Never returns success unless
- * the D1 ref change, audit row, and R2 copy all complete.
+ * audit atomically). The apply is guarded by the operation's expectedRef: if
+ * the field changed since creation the op becomes superseded and never
+ * overwrites a newer reference. Duplicate submissions with the same idemKey
+ * reuse the existing group instead of competing.
  */
 async function uploadMedia(
   c: any,
@@ -237,13 +259,20 @@ async function uploadMedia(
   targetColumn: string,
   auditAction: string,
   contentType: string,
-  oldKey: string | null
-): Promise<Response | void> {
+  oldKey: string | null,
+  expectedRef: string | null,
+  idemKey: string | null,
+  redirectPath: string
+): Promise<Response> {
   if (!(SAFE_COLUMNS as readonly string[]).includes(targetColumn)) {
     return auditedMutationError(c, new Error('invalid target'), 'Media update failed');
   }
   const actor = actorContext(c);
   try {
+    if (idemKey) {
+      const existing = await findMediaGroupByKey(c.env.DB, idemKey);
+      if (existing) return c.redirect(redirectPath);
+    }
     const stagingKey = `staging/${generateId()}`;
     await c.env.BUCKET.put(stagingKey, file.stream(), { httpMetadata: { contentType } });
 
@@ -255,6 +284,9 @@ async function uploadMedia(
         targetType: 'event',
         targetEventId,
         targetColumn,
+        expectedRef,
+        intendedRef: key,
+        idempotencyKey: idemKey ?? undefined,
         tenantId: actor.tenantId,
         auditAction,
         actorId: actor.actorId,
@@ -267,6 +299,8 @@ async function uploadMedia(
         action: 'delete',
         key: oldKey,
         targetType: 'event',
+        expectedRef: oldKey,
+        intendedRef: null,
         tenantId: actor.tenantId,
         auditAction,
         actorId: actor.actorId,
@@ -275,9 +309,10 @@ async function uploadMedia(
       });
     }
 
-    const groupId = await enqueueMediaOps(c.env.DB, ops);
+    const groupId = await enqueueMediaOps(c.env.DB, ops, idemKey ?? undefined);
     const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
     if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Media update failed');
+    return c.redirect(redirectPath);
   } catch (err) {
     return auditedMutationError(c, err, 'Media update failed');
   }
@@ -287,7 +322,8 @@ async function uploadMedia(
  * Clear an event media column via the durable outbox: the DB ref change, its
  * audit row, and the R2 delete record(s) commit in ONE batch; the R2 deletes
  * then run idempotently (refcount-guarded). Never reports success unless the
- * D1 change, audit row, and R2 deletes all complete.
+ * D1 change, audit row, and R2 deletes all complete. Duplicate submissions
+ * with the same idemKey reuse the existing group.
  */
 async function deleteEventMedia(
   c: any,
@@ -295,8 +331,10 @@ async function deleteEventMedia(
   eventId: string,
   targetColumn: string,
   auditAction: string,
-  keys: (string | null | undefined)[]
-): Promise<Response | void> {
+  keys: (string | null | undefined)[],
+  expectedRef: string | null,
+  idemKey: string | null
+): Promise<Response> {
   if (!(SAFE_COLUMNS as readonly string[]).includes(targetColumn)) {
     return auditedMutationError(c, new Error('invalid target'), 'Media delete failed');
   }
@@ -327,12 +365,15 @@ async function deleteEventMedia(
         action: 'delete' as const,
         key,
         targetType: 'event',
+        expectedRef,
+        intendedRef: null,
         tenantId: actor.tenantId,
         auditAction,
         actorId: actor.actorId,
         actorEmail: actor.actorEmail,
         requestId: actor.requestId,
-      }))
+      })),
+      idemKey ?? undefined
     );
     const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
     if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Media delete failed');
@@ -843,6 +884,9 @@ async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
   (function() {
     var token = (document.querySelector('meta[name="csrf-token"]') || {}).getAttribute('content');
     if (!token) return;
+    // Per-page idempotency key: duplicate submissions of the same form/fetch
+    // reuse one media operation instead of creating competing ones.
+    var idemKey = 'idem-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
     document.querySelectorAll('form[method="post" i]').forEach(function(f) {
       if (f.querySelector('input[name="_csrf"]')) return;
       var i = document.createElement('input');
@@ -850,6 +894,13 @@ async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
       i.name = '_csrf';
       i.value = token;
       f.appendChild(i);
+      if (!f.querySelector('input[name="_idem"]')) {
+        var d = document.createElement('input');
+        d.type = 'hidden';
+        d.name = '_idem';
+        d.value = idemKey;
+        f.appendChild(d);
+      }
     });
     var origFetch = window.fetch;
     window.fetch = function(input, init) {
@@ -860,6 +911,8 @@ async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
         init.headers = init.headers || {};
         if (init.headers instanceof Headers) init.headers.set('X-CSRF-Token', token);
         else init.headers['X-CSRF-Token'] = token;
+        if (init.headers instanceof Headers) init.headers.set('X-Idempotency-Key', idemKey);
+        else init.headers['X-Idempotency-Key'] = idemKey;
       }
       return origFetch.call(this, input, init);
     };
@@ -2124,6 +2177,7 @@ app.post('/admin/storage/delete', async (c) => {
   const form = await c.req.formData();
   const key = form.get('key') as string | null;
   if (!key) return c.redirect('/admin/storage');
+  const idemKey = await idempotencyKeyOf(c, form);
 
   const actor = actorContext(c);
   try {
@@ -2145,7 +2199,8 @@ app.post('/admin/storage/delete', async (c) => {
         outcome: 'success',
         requestId: actor.requestId,
       },
-      [{ action: 'delete', key, targetType: 'storage', tenantId: actor.tenantId, auditAction: 'admin.storage.delete', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+      [{ action: 'delete', key, targetType: 'storage', expectedRef: key, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.storage.delete', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+      idemKey ?? undefined
     );
     const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
     if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Storage delete failed');
@@ -2159,6 +2214,7 @@ app.post('/admin/storage/bulk-delete', async (c) => {
   const form = await c.req.formData();
   const keysStr = form.get('keys') as string | null;
   if (!keysStr) return c.redirect('/admin/storage');
+  const idemKey = await idempotencyKeyOf(c, form);
 
   let keys: string[];
   try {
@@ -2192,12 +2248,15 @@ app.post('/admin/storage/bulk-delete', async (c) => {
         action: 'delete' as const,
         key,
         targetType: 'storage',
+        expectedRef: key,
+        intendedRef: null,
         tenantId: actor.tenantId,
         auditAction: 'admin.storage.bulk_delete',
         actorId: actor.actorId,
         actorEmail: actor.actorEmail,
         requestId: actor.requestId,
-      }))
+      })),
+      idemKey ?? undefined
     );
     const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
     if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Bulk delete failed');
@@ -2215,8 +2274,13 @@ app.post('/admin/storage/rename', async (c) => {
   const form = await c.req.formData();
   const oldKey = form.get('oldKey') as string | null;
   const newKey = form.get('newKey') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (oldKey && newKey && oldKey !== newKey) {
+    if (idemKey) {
+      const existing = await findMediaGroupByKey(c.env.DB, idemKey);
+      if (existing) return c.redirect('/admin/storage');
+    }
     const actor = actorContext(c);
     const oldObj = await c.env.BUCKET.get(oldKey).catch(() => null);
     if (!oldObj) {
@@ -2253,7 +2317,8 @@ app.post('/admin/storage/rename', async (c) => {
           outcome: 'success',
           requestId: actor.requestId,
         },
-        [{ action: 'delete', key: oldKey, targetType: 'storage', tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+        [{ action: 'delete', key: oldKey, targetType: 'storage', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
       );
       const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
       if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Rename failed');
@@ -2261,7 +2326,7 @@ app.post('/admin/storage/rename', async (c) => {
       // The D1 repoint failed after the copy succeeded: newKey is orphaned.
       // Record a durable delete so it is cleaned up via the media-ops outbox.
       const orphanGroup = await enqueueMediaOps(c.env.DB, [
-        { action: 'delete', key: newKey, targetType: 'storage', tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId },
+        { action: 'delete', key: newKey, targetType: 'storage', expectedRef: newKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId },
       ]).catch(() => null);
       if (orphanGroup) {
         await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, orphanGroup);
@@ -2330,7 +2395,7 @@ app.get('/admin/media-ops', async (c) => {
   const body = `
     <div class="max-w-6xl mx-auto p-6">
       <h1 class="text-xl font-bold text-gray-900 mb-2">Media Operations</h1>
-      <p class="text-sm text-gray-500 mb-4">R2 + D1 consistency outbox. A request only reports success once its D1 change, audit row, and R2 operation all complete. A 500 response may leave an operation pending reconciliation — it is not rolled back. Retries are idempotent, refcount-guarded, and serialized per group. Object keys are intentionally not displayed.</p>
+      <p class="text-sm text-gray-500 mb-4">R2 + D1 consistency outbox. Statuses: pending, completed, failed, or superseded (a newer operation won; never re-applied). A request only reports success once its D1 change, audit row, and R2 operation all complete. A 500 response may leave an operation pending reconciliation — it is not rolled back. Retries are idempotent, refcount-guarded, and serialized per group. Object keys are intentionally not displayed.</p>
       ${ops.length === 0 ? '<p class="text-gray-500">No pending or failed media operations.</p>' : `
       <table class="w-full text-left border border-gray-200 rounded-lg overflow-hidden">
         <thead class="bg-gray-50 text-gray-600 text-xs uppercase">
@@ -3181,6 +3246,7 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
     const oldKey = event.photo_key && event.photo_key !== existingKey ? event.photo_key : null;
@@ -3211,7 +3277,8 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
           outcome: 'success',
           requestId: actor.requestId,
         },
-        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
       );
       const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
       if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Photo update failed');
@@ -3229,10 +3296,7 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
 
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `events/${event.id}/${generateId()}.${ext}`;
-  const res = await uploadMedia(c, file, key, event.id, 'photo_key', 'admin.event.photo', file.type || 'image/jpeg', event.photo_key || null);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'photo_key', 'admin.event.photo', file.type || 'image/jpeg', event.photo_key || null, event.photo_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -3249,10 +3313,8 @@ app.post('/admin/events/:adminToken/photo/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  const res = await deleteEventMedia(c, adminToken, event.id, 'photo_key', 'admin.event.photo_delete', [event.photo_key]);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'photo_key', 'admin.event.photo_delete', [event.photo_key], event.photo_key ?? null, idemKey);
 });
 
 // ---------------------------------------------------------------------------
@@ -3271,6 +3333,7 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
     const oldKey = event.agent_photo_key && event.agent_photo_key !== existingKey ? event.agent_photo_key : null;
@@ -3301,7 +3364,8 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
           outcome: 'success',
           requestId: actor.requestId,
         },
-        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
       );
       const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
       if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Agent photo update failed');
@@ -3319,10 +3383,7 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
 
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `agents/${event.id}/${generateId()}.${ext}`;
-  const res = await uploadMedia(c, file, key, event.id, 'agent_photo_key', 'admin.event.agent_photo', file.type || 'image/jpeg', event.agent_photo_key || null);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'agent_photo_key', 'admin.event.agent_photo', file.type || 'image/jpeg', event.agent_photo_key || null, event.agent_photo_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -3341,6 +3402,7 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
     const oldKey = event.agent_photo_2_key && event.agent_photo_2_key !== existingKey ? event.agent_photo_2_key : null;
@@ -3371,7 +3433,8 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
           outcome: 'success',
           requestId: actor.requestId,
         },
-        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo_2', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo_2', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
       );
       const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
       if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Agent photo 2 update failed');
@@ -3389,10 +3452,7 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
 
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `agents/${event.id}/${generateId()}_2.${ext}`;
-  const res = await uploadMedia(c, file, key, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2', file.type || 'image/jpeg', event.agent_photo_2_key || null);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2', file.type || 'image/jpeg', event.agent_photo_2_key || null, event.agent_photo_2_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -3409,10 +3469,8 @@ app.post('/admin/events/:adminToken/agent-photo/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  const res = await deleteEventMedia(c, adminToken, event.id, 'agent_photo_key', 'admin.event.agent_photo_delete', [event.agent_photo_key]);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'agent_photo_key', 'admin.event.agent_photo_delete', [event.agent_photo_key], event.agent_photo_key ?? null, idemKey);
 });
 
 app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
@@ -3425,10 +3483,8 @@ app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  const res = await deleteEventMedia(c, adminToken, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2_delete', [event.agent_photo_2_key]);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2_delete', [event.agent_photo_2_key], event.agent_photo_2_key ?? null, idemKey);
 });
 
 // ---------------------------------------------------------------------------
@@ -3447,6 +3503,7 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
     const oldKey = event.flyer_key && event.flyer_key !== existingKey ? event.flyer_key : null;
@@ -3477,7 +3534,8 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
           outcome: 'success',
           requestId: actor.requestId,
         },
-        [{ action: 'delete', key: oldKey, targetType: 'event', tenantId: actor.tenantId, auditAction: 'admin.event.flyer', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }]
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.flyer', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
       );
       const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
       if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Flyer update failed');
@@ -3512,10 +3570,7 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
   }
 
   const key = `flyers/${event.id}/${generateId()}.${rawExt}`;
-  const res = await uploadMedia(c, file, key, event.id, 'flyer_key', 'admin.event.flyer', safeContentType, event.flyer_key || null);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'flyer_key', 'admin.event.flyer', safeContentType, event.flyer_key || null, event.flyer_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -3532,10 +3587,8 @@ app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
 
   if (!event) return c.notFound();
 
-  const res = await deleteEventMedia(c, adminToken, event.id, 'flyer_key', 'admin.event.flyer_delete', [event.flyer_key]);
-  if (res) return res;
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'flyer_key', 'admin.event.flyer_delete', [event.flyer_key], event.flyer_key ?? null, idemKey);
 });
 
 // ---------------------------------------------------------------------------
@@ -3690,6 +3743,8 @@ app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
 
   if (!event) return c.notFound();
 
+  const idemKey = await idempotencyKeyOf(c);
+
   const actor = actorContext(c);
   const mediaKeys = [event.photo_key, event.agent_photo_key, event.agent_photo_2_key, event.flyer_key].filter(
     (k): k is string => Boolean(k)
@@ -3718,12 +3773,15 @@ app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
         action: 'delete' as const,
         key,
         targetType: 'event',
+        expectedRef: key,
+        intendedRef: null,
         tenantId: actor.tenantId,
         auditAction: 'admin.event.permanent_delete',
         actorId: actor.actorId,
         actorEmail: actor.actorEmail,
         requestId: actor.requestId,
-      }))
+      })),
+      idemKey ?? undefined
     );
     const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
     if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Permanent delete failed');

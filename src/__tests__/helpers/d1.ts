@@ -77,8 +77,8 @@ export class SqliteD1 {
     const stmt = this.db.prepare(sql);
     const makeRunner = (args: unknown[]): BoundRunner => ({
       run: async () => {
-        stmt.run(...args);
-        return { success: true, meta: {} };
+        const res = stmt.run(...args) as unknown as { changes: number };
+        return { success: true, meta: { changes: res.changes } };
       },
       all: async <T>() => {
         const rows = stmt.all(...args) as unknown as T[];
@@ -113,9 +113,9 @@ export class SqliteD1 {
       for (const stmt of statements as BoundRunner[]) {
         const runner = stmt.__stmt
           ? (() => {
-              const s = stmt.__stmt as { run: (...a: unknown[]) => unknown };
-              s.run(...stmt.__args);
-              return { success: true, meta: {} };
+              const s = stmt.__stmt as { run: (...a: unknown[]) => { changes: number } };
+              const res = s.run(...stmt.__args);
+              return { success: true, meta: { changes: res.changes } };
             })()
           : await stmt.run();
         results.push(runner);

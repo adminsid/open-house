@@ -150,7 +150,7 @@ describe('R2 consistency: upload failure / retry matrix', () => {
     expect(ops.every((o) => o.status === 'done')).toBe(true);
   });
 
-  it('R2 put succeeds + D1/audit fails: op stays pending, ref unchanged, retry completes', async () => {
+  it('R2 put succeeds + D1/audit fails: op stays pending, guarded ref applied, retry completes audit', async () => {
     await db.exec('DROP TABLE admin_audit');
 
     const form = uploadForm();
@@ -158,16 +158,17 @@ describe('R2 consistency: upload failure / retry matrix', () => {
     const res = await postUpload(env, token, form);
     expect(res.status).toBe(500);
 
-    // DB ref unchanged; op pending with one failed attempt; staging + final objects both exist.
-    const row = db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1');
-    expect(row!.photo_key).toBeNull();
+    // The guarded UPDATE committed; the audit finalize batch rolled back, so the
+    // op stays pending with one failed attempt. Staging + final objects exist.
     const ops = mediaOps(db);
     expect(ops).toHaveLength(1);
     expect(ops[0].status).toBe('pending');
     expect(ops[0].attempts).toBe(1);
     expect(ops[0].error_code).toBe('MEDIA_APPLY_FAILED');
     const finalKey = ops[0].key as string;
-    expect(bucket.store.has(finalKey)).toBe(true); // copy succeeded before the D1 batch failed
+    const row = db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1');
+    expect(row!.photo_key).toBe(finalKey);
+    expect(bucket.store.has(finalKey)).toBe(true);
     expect(bucket.keys().some((k) => k.startsWith('staging/'))).toBe(true);
 
     // Repair and retry via the operator reconciliation endpoint.
@@ -473,39 +474,104 @@ describe('R2 consistency: recovery semantics', () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it('duplicate submission after an HTTP 500 creates an independent op; the stale op is pending reconciliation, not rolled back', async () => {
+  it('failed A, successful B, retry A: B stays referenced, A becomes superseded, A cleanup never deletes B', async () => {
+    // Operation A fails (audit table unavailable).
     await db.exec('DROP TABLE admin_audit');
-    const form1 = uploadForm();
-    form1.set('_csrf', await csrfOf(db));
-    const first = await postUpload(env, token, form1);
-    expect(first.status).toBe(500);
-    const firstOp = mediaOps(db)[0];
-    expect(firstOp.status).toBe('pending');
-    expect(firstOp.error_code).toBe('MEDIA_APPLY_FAILED');
+    const formA = uploadForm();
+    formA.set('_csrf', await csrfOf(db));
+    expect((await postUpload(env, token, formA)).status).toBe(500);
+    const opA = mediaOps(db)[0];
+    expect(opA.status).toBe('pending');
 
-    // Re-submission after the 500 succeeds independently.
+    // Operation B succeeds against the same field.
     recreateAdminAudit(db);
-    const form2 = uploadForm();
-    form2.set('_csrf', await csrfOf(db));
-    const second = await postUpload(env, token, form2);
-    expect(second.status).toBe(302);
+    const formB = uploadForm('b.jpg');
+    formB.set('_csrf', await csrfOf(db));
+    expect((await postUpload(env, token, formB)).status).toBe(302);
+    const opB = mediaOps(db).find((o) => o.status === 'done')!;
+    const keyB = opB.key as string;
+    expect(db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1')!.photo_key).toBe(keyB);
+
+    // Retrying A must NOT overwrite B: A becomes superseded, no audit-success.
+    const logs: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => logs.push(String(line)));
+    vi.spyOn(console, 'error').mockImplementation((line: string) => logs.push(String(line)));
+    const retryA = await request(`/admin/media-ops/retry/${opA.id}`, env, {
+      method: 'POST',
+      headers: await authHeaders(db, token),
+    });
+    expect(retryA.status).toBe(500); // superseded is terminal; no re-apply
 
     const ops = mediaOps(db);
-    expect(ops).toHaveLength(2);
-    expect(ops[0].group_id).not.toBe(ops[1].group_id);
-    const secondDone = ops.find((o) => o.status === 'done')!;
-    const stale = ops.find((o) => o.status !== 'done')!;
-    expect(db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1')!.photo_key).toBe(secondDone.key as string);
-    expect(auditRows(db, 'admin.event.photo')).toHaveLength(1);
+    const aAfter = ops.find((o) => o.id === opA.id)!;
+    expect(aAfter.status).toBe('superseded');
+    expect(db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1')!.photo_key).toBe(keyB);
+    expect(auditRows(db, 'admin.event.photo')).toHaveLength(1); // only B's success
 
-    // Retrying the stale op applies it (last-writer-wins on the column) and is fully recoverable.
-    const retry = await request(`/admin/media-ops/retry/${stale.id}`, env, {
+    // B's object survives; A's owned objects (staging + any final key) are gone.
+    expect(bucket.store.has(keyB)).toBe(true);
+    expect(bucket.keys().some((k) => k.startsWith('staging/'))).toBe(false);
+    expect(bucket.store.has(opA.key as string)).toBe(false);
+
+    // A retry of a superseded op is a no-op.
+    const again = await request(`/admin/media-ops/retry/${opA.id}`, env, {
+      method: 'POST',
+      headers: await authHeaders(db, token),
+    });
+    expect(again.status).toBe(302);
+    expect(auditRows(db, 'admin.event.photo')).toHaveLength(1);
+    expect(mediaOps(db).find((o) => o.id === opA.id)!.status).toBe('superseded');
+
+    // No key or raw error leaks into logs.
+    const serializedLogs = logs.join('\n');
+    expect(serializedLogs).not.toContain(keyB);
+    expect(serializedLogs).not.toContain(opA.key as string);
+    expect(serializedLogs).not.toContain('staging/');
+  });
+
+  it('duplicate same submission (same idempotency key) produces one logical operation and one audit record', async () => {
+    const form = uploadForm();
+    form.set('_csrf', await csrfOf(db));
+    form.set('_idem', 'idem-dup');
+    const first = await postUpload(env, token, form);
+    expect(first.status).toBe(302);
+    expect(mediaOps(db)).toHaveLength(1);
+    expect(auditRows(db, 'admin.event.photo')).toHaveLength(1);
+    const refAfterFirst = db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1')!.photo_key;
+
+    // Re-submit the identical form (same _idem): reuse the existing group.
+    const second = await postUpload(env, token, form);
+    expect(second.status).toBe(302);
+    expect(mediaOps(db)).toHaveLength(1);
+    expect(auditRows(db, 'admin.event.photo')).toHaveLength(1);
+    expect(db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1')!.photo_key).toBe(refAfterFirst);
+    // No competing staging/final objects were created.
+    expect(bucket.keys().filter((k) => k.startsWith('staging/'))).toHaveLength(0);
+    expect(bucket.keys().length).toBe(1);
+  });
+
+  it('duplicate submission after an HTTP 500 reuses the pending group instead of competing', async () => {
+    await db.exec('DROP TABLE admin_audit');
+    const form = uploadForm();
+    form.set('_csrf', await csrfOf(db));
+    form.set('_idem', 'idem-500');
+    expect((await postUpload(env, token, form)).status).toBe(500);
+    expect(mediaOps(db)).toHaveLength(1);
+
+    // Same _idem resubmission must not create a second operation.
+    recreateAdminAudit(db);
+    expect((await postUpload(env, token, form)).status).toBe(302);
+    expect(mediaOps(db)).toHaveLength(1);
+
+    // Operator retry completes the single pending op.
+    const opId = mediaOps(db)[0].id as string;
+    const retry = await request(`/admin/media-ops/retry/${opId}`, env, {
       method: 'POST',
       headers: await authHeaders(db, token),
     });
     expect(retry.status).toBe(302);
-    expect(db.queryOne<{ photo_key: string | null }>('SELECT photo_key FROM events WHERE id = ?', 'evt_1')!.photo_key).toBe(stale.key as string);
-    expect(auditRows(db, 'admin.event.photo')).toHaveLength(2);
+    expect(mediaOps(db)[0].status).toBe('done');
+    expect(auditRows(db, 'admin.event.photo')).toHaveLength(1);
   });
 
   it('retry of a completed group is a no-op: no re-apply, no duplicate audit', async () => {
