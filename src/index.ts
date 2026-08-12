@@ -791,6 +791,20 @@ app.get('/setup', async (c) => {
 });
 
 app.post('/setup', async (c) => {
+  // Pre-session origin check: /setup and /login run before any admin session
+  // exists, so they cannot rely on a CSRF token. Same strict origin policy
+  // as every other state-changing route applies here.
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: '/setup',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
   const { results } = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').all();
   if (results && results.length > 0) {
     return c.redirect('/admin');
@@ -876,6 +890,19 @@ app.get('/login', (c) => {
 });
 
 app.post('/login', async (c) => {
+  // Pre-session origin check: no session/CSRF token exists yet, so validate
+  // the Origin/Referer directly (same policy as all state-changing routes).
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: '/login',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
   const form = await c.req.formData();
   const username = (form.get('username') as string)?.trim();
   const password = (form.get('password') as string);

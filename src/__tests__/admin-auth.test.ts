@@ -407,7 +407,7 @@ describe('login flow creates a server-side session', () => {
     const env = await makeEnv(db, true);
     const res = await request('/login', env, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
       body: 'username=admin@example.com&password=secret-password',
     });
     expect(res.status).toBe(302);
@@ -423,11 +423,75 @@ describe('login flow creates a server-side session', () => {
     const env = await makeEnv(db, true);
     const res = await request('/login', env, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
       body: 'username=admin@example.com&password=wrong',
     });
     expect(res.status).toBe(401);
     expect(cookieFrom(res, 'oh_session')).toBeNull();
+  });
+
+  it('rejects a cross-origin POST /login with 403 and creates no session', async () => {
+    const db = makeDb();
+    const env = await makeEnv(db, true);
+    const res = await request('/login', env, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'https://evil.example.com' },
+      body: 'username=admin@example.com&password=secret-password',
+    });
+    expect(res.status).toBe(403);
+    expect(db.query('SELECT * FROM admin_sessions')).toHaveLength(0);
+    expect(cookieFrom(res, 'oh_session')).toBeNull();
+  });
+
+  it('rejects a POST /login with no Origin and no Referer with 403', async () => {
+    const db = makeDb();
+    const env = await makeEnv(db, true);
+    const res = await request('/login', env, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'username=admin@example.com&password=secret-password',
+    });
+    expect(res.status).toBe(403);
+    expect(db.query('SELECT * FROM admin_sessions')).toHaveLength(0);
+  });
+
+  it('accepts a same-origin Referer when Origin is absent', async () => {
+    const db = makeDb();
+    const env = await makeEnv(db, true);
+    const res = await request('/login', env, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: ORIGIN + '/login' },
+      body: 'username=admin@example.com&password=secret-password',
+    });
+    expect(res.status).toBe(302);
+    expect(cookieFrom(res, 'oh_session')).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('rejects a cross-origin POST /setup with 403 and creates no admin', async () => {
+    const db = makeDb();
+    const env = await makeEnv(db, true);
+    await db.exec('DELETE FROM admins');
+    const res = await request('/setup', env, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'https://evil.example.com' },
+      body: 'name=Hacker&username=hacker%40example.com&password=whatever',
+    });
+    expect(res.status).toBe(403);
+    expect(db.query('SELECT * FROM admins')).toHaveLength(0);
+  });
+
+  it('allows a same-origin POST /setup to create the first admin and tenant-scoped session', async () => {
+    const db = makeDb();
+    const env = await makeEnv(db, true);
+    await db.exec('DELETE FROM admins');
+    const res = await request('/setup', env, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+      body: 'name=First+Admin&username=first%40example.com&password=s3cret',
+    });
+    expect(res.status).toBe(302);
+    const row = db.queryOne<{ tenant_id: string | null }>('SELECT tenant_id FROM admin_sessions LIMIT 1');
+    expect(row!.tenant_id).toBe('tenant_primeamerica');
   });
 });
 
