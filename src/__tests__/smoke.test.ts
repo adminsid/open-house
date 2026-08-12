@@ -43,6 +43,7 @@ describe('launch smoke: containment, agent 503, public routes', () => {
       APP_URL: BASE,
       WORKSPACE_URL: WORKSPACE,
       ADMIN_TENANT_ID: 'tenant_primeamerica',
+      CONTAINMENT_ENABLED: 'false',
     };
   });
 
@@ -51,9 +52,9 @@ describe('launch smoke: containment, agent 503, public routes', () => {
     return await worker.fetch(req, env as any, {} as any);
   }
 
-  it('/admin/* returns 503 while containment stays on (production default, CONTAINMENT_ENABLED unset)', async () => {
-    expect((await request('/admin')).status).toBe(503);
-    expect((await request('/admin/events/admin_token_a', { headers: { Accept: 'text/html' } })).status).toBe(503);
+  it('/admin/* reaches the authentication boundary when containment is disabled', async () => {
+    expect((await request('/admin')).status).toBe(401);
+    expect((await request('/admin/events/admin_token_a', { headers: { Accept: 'text/html' } })).status).toBe(302);
   });
 
   it('/agent/* returns a generic 503 for every method', async () => {

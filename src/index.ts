@@ -662,9 +662,9 @@ const app = new Hono<{ Bindings: Bindings; Variables: { session: Session } }>();
 // ---------------------------------------------------------------------------
 
 app.use('*', async (c, next) => {
-  // Local/CI Worker tests set CONTAINMENT_ENABLED=false to exercise the
-  // authenticated handlers. Deployed configs never set this var, so
-  // production stays behind the 503 guard until the fix is verified.
+  // Local/CI tests and the verified production config set
+  // CONTAINMENT_ENABLED=false to exercise the authenticated handlers. Any
+  // other value keeps the emergency 503 guard active.
   if (c.env.CONTAINMENT_ENABLED === 'false') {
     return await next();
   }

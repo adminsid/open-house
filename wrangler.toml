@@ -23,6 +23,9 @@ custom_domain = true
 [vars]
 APP_URL = "https://openhouse.primeamericarealestate.com"
 WORKSPACE_URL = "https://workspace.primeamericany.com"
+# Admin authentication is fully session-, tenant-, and CSRF-gated below.
+# Keep the emergency containment middleware available as a kill switch.
+CONTAINMENT_ENABLED = "false"
 # Server-side tenant assignment for legacy direct-login / first-run setup
 # sessions. Trusted config, never client-supplied. Direct login without this
 # produces a session with no tenant, which fails closed at every admin gate.
