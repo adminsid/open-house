@@ -57,18 +57,10 @@ describe('launch smoke: containment, agent 503, public routes', () => {
     expect((await request('/admin/events/admin_token_a', { headers: { Accept: 'text/html' } })).status).toBe(302);
   });
 
-  it('/agent/* returns a generic 503 for every method', async () => {
-    for (const [path, init] of [
-      ['/agent/admin_token_a', { headers: { Accept: 'text/html' } }],
-      ['/agent/admin_token_a/export.csv', {}],
-      ['/agent/admin_token_a/guests/g1/checkin', { method: 'POST' }],
-    ] as Array<[string, RequestInit]>) {
-      const res = await request(path, init);
-      expect(res.status).toBe(503);
-      expect(await res.text()).toBe('Agent access is temporarily unavailable');
-      expect(res.headers.get('cache-control')).toBe('no-store');
-      expect(res.headers.get('retry-after')).toBe('3600');
-    }
+  it('/agent/* serves the public agent capability page', async () => {
+    const res = await request('/agent/admin_token_a', { headers: { Accept: 'text/html' } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Prime Home');
   });
 
   it('public sign-in, RSVP, and media routes keep their intended behavior', async () => {
