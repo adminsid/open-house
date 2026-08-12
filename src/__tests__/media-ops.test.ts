@@ -743,3 +743,87 @@ describe('R2 consistency: media-ops endpoint authorization', () => {
     expect(mediaOps(db)[0].status).toBe('done');
   });
 });
+
+describe('mutation error logging sanitization', () => {
+  let db: SqliteD1;
+  let bucket: MockR2Bucket;
+  let env: Record<string, unknown>;
+  let token: string;
+
+  beforeEach(async () => {
+    db = makeDb();
+    bucket = new MockR2Bucket();
+    env = await makeEnv(db, bucket);
+    token = await sessionToken(db);
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('event-create failure logs a fixed structured code and never renders raw error detail', async () => {
+    await db.exec('DROP TABLE events');
+    const logs: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => logs.push(String(line)));
+    vi.spyOn(console, 'error').mockImplementation((line: string) => logs.push(String(line)));
+
+    const res = await request('/admin/events/new', env, {
+      method: 'POST',
+      headers: { ...(await authHeaders(db, token)), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: [
+        'title=New+Event',
+        'property_address=9+Oak+St',
+        'agent_name=Bob',
+        'agent_email=bob%40example.com',
+        'start_time=2026-02-01T10%3A00',
+        'end_time=2026-02-01T12%3A00',
+        'timezone=America%2FNew_York',
+      ].join('&'),
+    });
+    expect(res.status).toBe(500);
+
+    const bodyText = await res.text();
+    expect(bodyText).not.toContain('no such table');
+    expect(bodyText).not.toContain('SQLite');
+    expect(bodyText).toContain('The event could not be created');
+
+    const serializedLogs = logs.join('\n');
+    expect(serializedLogs).toContain('"event":"admin.mutation.error"');
+    expect(serializedLogs).toContain('"message":"Create failed"');
+    expect(serializedLogs).not.toContain('no such table');
+    expect(serializedLogs).not.toContain('bob@example.com');
+  });
+
+  it('an intentionally key-bearing thrown error never reaches logs, responses, audit, or UI', async () => {
+    // The R2 mock embeds the storage key in thrown errors; exercise every
+    // failure direction and assert no key/raw text leaks anywhere.
+    const logs: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => logs.push(String(line)));
+    vi.spyOn(console, 'error').mockImplementation((line: string) => logs.push(String(line)));
+    const KEY = 'events/evt_1/secret-object.jpg';
+    await bucket.put(KEY, 'data');
+    await db.exec(
+      `INSERT INTO events (id, title, property_address, agent_name, agent_email, start_time, end_time, timezone,
+         status, admin_token, public_token, tenant_id, photo_key, created_at, updated_at)
+       VALUES ('evt_1', 'Prime Home', '1 Main St', 'Alice', 'alice@example.com',
+         '2026-01-01T10:00:00.000Z', '2026-01-01T12:00:00.000Z', 'America/New_York',
+         'scheduled', 'admin_token_a', 'public_token_a', 'tenant_primeamerica', '${KEY}',
+         '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`
+    );
+
+    bucket.deleteFailKeys.add(KEY);
+    const form = new FormData();
+    form.set('key', KEY);
+    const res = await request('/admin/storage/delete', env, {
+      method: 'POST',
+      headers: await authHeaders(db, token),
+      body: form,
+    });
+    expect(res.status).toBe(500);
+
+    const bodyText = await res.text();
+    expect(bodyText).not.toContain(KEY);
+    expect(logs.join('\n')).not.toContain(KEY);
+    expect(JSON.stringify(auditRows(db, 'admin.storage.delete'))).not.toContain(KEY);
+    const page = await request('/admin/media-ops', env, { headers: { Cookie: `oh_session=${token}`, Accept: 'text/html' } });
+    expect(await page.text()).not.toContain(KEY);
+  });
+});

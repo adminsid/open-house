@@ -2563,15 +2563,17 @@ app.post('/admin/events/new', async (c) => {
     await commitAudited(c, { action: 'admin.event.create', targetType: 'event', targetId: id }, [insertStmt]);
 
     return c.redirect(`/admin/events/${admin_token}`);
-  } catch (err: any) {
-    console.error('Error creating event:', err);
+  } catch {
+    // Never log or render the caught error: it can embed SQL detail or other
+    // sensitive values. Fixed structured code only.
+    console.error(JSON.stringify({ event: 'admin.mutation.error', message: 'Create failed' }));
     return c.html(
       pageShell(
         'Error',
         `<div class="max-w-2xl mx-auto px-4 py-10">
           <div class="bg-white rounded-2xl shadow p-8 text-center">
             <h1 class="text-xl font-bold text-red-600 mb-4">Database Error<\/h1>
-            <p class="text-gray-600 mb-6">${escHtml(err.message || 'Unknown error')}<\/p>
+            <p class="text-gray-600 mb-6">The event could not be created. Please try again.<\/p>
             <a href="/admin/events/new" class="text-indigo-600 underline">Try again<\/a>
           </div>
         </div>`
