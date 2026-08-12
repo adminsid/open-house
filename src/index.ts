@@ -887,21 +887,28 @@ async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
     // Per-page idempotency key: duplicate submissions of the same form/fetch
     // reuse one media operation instead of creating competing ones.
     var idemKey = 'idem-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
-    document.querySelectorAll('form[method="post" i]').forEach(function(f) {
-      if (f.querySelector('input[name="_csrf"]')) return;
-      var i = document.createElement('input');
-      i.type = 'hidden';
-      i.name = '_csrf';
-      i.value = token;
-      f.appendChild(i);
-      if (!f.querySelector('input[name="_idem"]')) {
-        var d = document.createElement('input');
-        d.type = 'hidden';
-        d.name = '_idem';
-        d.value = idemKey;
-        f.appendChild(d);
-      }
-    });
+    function injectFormTokens() {
+      document.querySelectorAll('form[method="post" i]').forEach(function(f) {
+        if (f.querySelector('input[name="_csrf"]')) return;
+        var i = document.createElement('input');
+        i.type = 'hidden';
+        i.name = '_csrf';
+        i.value = token;
+        f.appendChild(i);
+        if (!f.querySelector('input[name="_idem"]')) {
+          var d = document.createElement('input');
+          d.type = 'hidden';
+          d.name = '_idem';
+          d.value = idemKey;
+          f.appendChild(d);
+        }
+      });
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', injectFormTokens);
+    } else {
+      injectFormTokens();
+    }
     var origFetch = window.fetch;
     window.fetch = function(input, init) {
       var url = typeof input === 'string' ? input : (input && input.url) || '';
