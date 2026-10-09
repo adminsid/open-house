@@ -1,5 +1,23 @@
+import { captureOfflineAttendance } from './lib/offline-attendance';
+import { deliverAttendance, replayAttendance } from './lib/attendance-delivery';
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
+import { emitLog, generateRequestId } from './lib/logger';
+import { SESSION_COOKIE, createSession, validateSession, revokeSession, ABSOLUTE_TTL_SECONDS, type Session } from './lib/sessions';
+import { completeSsoLogin } from './lib/sso';
+import { isApprovedOrigin, extractCsrfToken, safeEqual } from './lib/csrf';
+import { buildAuditStatement, type AuditRecord } from './lib/audit';
+import {
+  enqueueMediaOps,
+  enqueueMediaOpsAtomic,
+  executeMediaGroup,
+  retryMediaOp,
+  listMediaOps,
+  getMediaOp,
+  findMediaGroupByKey,
+  SAFE_COLUMNS,
+  type MediaOpInput,
+} from './lib/media-ops';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -9,8 +27,21 @@ type Bindings = {
   DB: D1Database;
   KV: KVNamespace;
   BUCKET: R2Bucket;
-  ADMIN_SECRET: string;
   APP_URL: string;
+  WORKSPACE_URL?: string;
+  INTERNAL_API_SECRET?: string;
+  // Server-side configuration for the single-tenant deployment: the tenant
+  // ID assigned to legacy direct-login / first-run setup sessions. Trusted
+  // server configuration — never derived from client input. Direct login
+  // without this configured creates a session with NO tenant, which then
+  // fails closed at every admin gate.
+  ADMIN_TENANT_ID?: string;
+  // Emergency-containment reopen switch. Only ever set to 'false' in local
+  // test/CI environments; deployed configs must leave it unset so /admin
+  // stays behind the 503 guard until the auth fix is fully verified.
+  CONTAINMENT_ENABLED?: string;
+  INVENTORY: Fetcher;
+  CRM: Fetcher;
 };
 
 type Admin = {
@@ -45,6 +76,15 @@ type Event = {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  tenant_id: string;
+  listing_id: string | null;
+  property_id: string | null;
+  agent_user_id: string | null;
+  professional_license_id: string | null;
+  listing_source: string | null;
+  listing_source_version: string | null;
+  listing_snapshot_synced_at: string | null;
+  listing_snapshot_json: string | null;
 };
 
 type GuestAnalytics = {
@@ -73,6 +113,31 @@ type Guest = {
   is_rsvp: number;
   checked_in: number;
   checked_in_at: string | null;
+  crm_contact_id: string | null;
+  consent_contact: number;
+  consent_marketing: number;
+  consent_captured_at: string | null;
+  crm_sync_status: string;
+  crm_synced_at: string | null;
+};
+
+type InventoryListing = {
+  id: string;
+  name: string;
+  status?: string | null;
+  listingStatus?: string | null;
+  approvalStatus?: string | null;
+  publicationStatus?: string | null;
+  isArchived?: boolean;
+  tenantId?: string | null;
+  propertyId?: string | null;
+  createdBy?: string | null;
+  updatedAt?: string | null;
+  data?: Record<string, unknown>;
+  access?: {
+    visibility?: string | null;
+    inviteOnlyToken?: string | null;
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -87,6 +152,388 @@ function generateToken(byteLength: number = 16): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(byteLength)))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
+}
+
+function normalizePhone(phone: string | null | undefined): string {
+  return (phone ?? '').replace(/\D/g, '');
+}
+
+function normalizeEmail(email: string | null | undefined): string {
+  return (email ?? '').trim().toLowerCase();
+}
+
+function getUserSession(c: any): { id?: string; email?: string; name?: string; role?: string } | null {
+  // Identity is taken ONLY from the validated server-side session (captured
+  // at SSO validation time). The legacy unsigned openhouse_user cookie is
+  // never trusted for identity, role, or assignment decisions.
+  const session = c.get('session') as Session | undefined;
+  if (!session) return null;
+  return {
+    id: session.userId,
+    email: session.userEmail ?? undefined,
+    name: session.userName ?? undefined,
+    role: session.role ?? undefined,
+  };
+}
+
+function isUserAssignedToEvent(user: { id?: string; email?: string; name?: string; role?: string } | null, ev: Event): boolean {
+  if (!user) return false; // fail closed: no trusted identity, no assignment
+  if (user.role === 'admin' || user.role === 'broker') return true;
+  if (ev.agent_user_id) return Boolean(user.id && user.id === ev.agent_user_id);
+  // Legacy events created before stable agent relationships were introduced.
+  const userEmail = (user.email || '').toLowerCase().trim();
+  const userName = (user.name || '').toLowerCase().trim();
+  const evEmail = (ev.agent_email || '').toLowerCase().trim();
+  const evName = (ev.agent_name || '').toLowerCase().trim();
+  return Boolean((userEmail && evEmail && userEmail === evEmail) || (userName && evName && userName === evName));
+}
+
+/** Raised when a request lacks a validated tenant (fail-closed authorization). */
+export class AuthError extends Error {}
+
+/**
+ * The tenant for the current ADMIN request, taken from the validated
+ * server-side session only — never from client input and never from a
+ * default. Throws AuthError when the request has no validated session or the
+ * session carries no tenant ID. Admin routes are pre-gated by
+ * adminRequireTenant so this is defense-in-depth, not the primary check.
+ */
+function sessionTenant(c: any): string {
+  const session = c.get('session') as Session | undefined;
+  if (!session?.tenantId) {
+    throw new AuthError('No validated server-side tenant for request');
+  }
+  return session.tenantId;
+}
+
+function inventoryHeaders(c: any): Record<string, string> {
+  const session = c.get('session') as Session | undefined;
+  return {
+    Accept: 'application/json',
+    ...(c.env.INTERNAL_API_SECRET ? { Authorization: `Bearer ${c.env.INTERNAL_API_SECRET}` } : {}),
+    'X-User-Id': session?.userId || 'open-house',
+    'X-User-Role': session?.role || 'agent',
+    'X-Tenant-Id': sessionTenant(c),
+    'X-User-Email': session?.userEmail || '',
+    'X-User-Name': session?.userName || '',
+  };
+}
+
+async function loadInventoryListings(c: any): Promise<InventoryListing[]> {
+  if (!c.env.INVENTORY) return [];
+  const response = await c.env.INVENTORY.fetch('https://inventory.internal/api/listings', {
+    headers: inventoryHeaders(c),
+  });
+  if (!response.ok) return [];
+  const body = await response.json() as any;
+  return Array.isArray(body?.listings) ? body.listings : [];
+}
+
+async function resolveInventoryListing(c: any, listingId: string): Promise<InventoryListing | null> {
+  if (!listingId) return null;
+  const response = await c.env.INVENTORY.fetch(`https://inventory.internal/api/listings/${encodeURIComponent(listingId)}`, {
+    headers: inventoryHeaders(c),
+  });
+  if (!response.ok) return null;
+  const listing = await response.json() as InventoryListing;
+  return listing?.tenantId === sessionTenant(c) ? listing : null;
+}
+
+function guestListingUrl(listing: InventoryListing): string | null {
+  if (listing.isArchived) return null;
+  const data = listing.data || {};
+  const status = String(data.listingStatus || listing.listingStatus || listing.status || '')
+    .trim().toLowerCase().replace(/\s+/g, '_');
+  if (['closed', 'expired', 'withdrawn', 'canceled', 'cancelled'].includes(status)) return null;
+
+  const visibility = String(listing.access?.visibility || data.accessVisibility || listing.publicationStatus || '')
+    .trim().toLowerCase().replace(/\s+/g, '_');
+  const baseUrl = `https://workspace.primeamericany.com/public/listings/${encodeURIComponent(listing.id)}`;
+  if (visibility === 'invite_only') {
+    const inviteToken = String(listing.access?.inviteOnlyToken || '').trim();
+    return inviteToken ? `${baseUrl}?inviteToken=${encodeURIComponent(inviteToken)}` : null;
+  }
+  if (visibility === 'public' && listing.approvalStatus === 'approved' && status === 'active') {
+    return baseUrl;
+  }
+  return null;
+}
+
+function listingSnapshot(listing: InventoryListing) {
+  const data = listing.data || {};
+  const address = String(data.fullAddress || [data.streetNumber, data.streetName, data.unitNumber, data.city, data.stateOrProvince, data.postalCode].filter(Boolean).join(' ') || listing.name).trim();
+  return {
+    listingId: listing.id,
+    propertyId: listing.propertyId || null,
+    agentUserId: String(data.listAgentUserId || listing.createdBy || '').trim(),
+    professionalLicenseId: String(data.listAgentProfessionalLicenseId || '').trim() || null,
+    agentName: String(data.listAgentFullName || '').trim(),
+    agentEmail: String(data.listAgentEmail || '').trim(),
+    agentPhone: String(data.listAgentDirectPhone || '').trim() || null,
+    address,
+    listingUrl: guestListingUrl(listing),
+    source: 'listing-input',
+    sourceVersion: listing.updatedAt || null,
+    syncedAt: new Date().toISOString(),
+  };
+}
+
+function eventCreationError(message: string, status: 400 | 404 | 422, listingId?: string): Response {
+  const inventoryLink = listingId
+    ? `<a href="https://inventory.primeamericarealestate.com/listings/${encodeURIComponent(listingId)}"
+         class="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700">
+         Open listing in Inventory
+       <\/a>`
+    : '';
+  return new Response(
+    pageShell(
+      'Event not created',
+      `<div class="flex min-h-screen items-center justify-center px-4">
+        <div class="w-full max-w-lg rounded-2xl bg-white p-8 text-center shadow">
+          <h1 class="mb-3 text-xl font-bold text-red-600">Event not created<\/h1>
+          <p class="mb-6 text-gray-700">${escHtml(message)}<\/p>
+          <div class="flex flex-wrap justify-center gap-3">
+            ${inventoryLink}
+            <a href="/admin/events/new" class="inline-flex items-center justify-center rounded-lg border border-gray-300 px-4 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">Back to New Event<\/a>
+          <\/div>
+        <\/div>
+      <\/div>`
+    ),
+    { status, headers: { 'Content-Type': 'text/html; charset=UTF-8' } }
+  );
+}
+
+async function syncGuestToCrm(c: any, _event: Event, guest: {
+  id: string; firstName: string; lastName: string; email: string | null; phone: string | null;
+  address: string | null; notes: string | null; consentMarketing: number; consentCapturedAt: string;
+  occurredAt: string;
+}): Promise<void> {
+  await deliverAttendance(c.env, guest.id);
+}
+
+/**
+ * Commit one or more data-change statements AND the audit record for them in a
+ * single atomic batch. If the audit INSERT fails, the whole batch fails and
+ * the data change does not persist (fail-closed audit trail). The caller is
+ * responsible for catching the error and returning an error response.
+ */
+async function commitAudited(
+  c: any,
+  record: Omit<AuditRecord, 'actorId' | 'actorEmail' | 'tenantId' | 'outcome' | 'requestId'>,
+  stmts: D1PreparedStatement[]
+): Promise<void> {
+  const session = c.get('session') as Session | undefined;
+  const auditStmt = await buildAuditStatement(c.env.DB, {
+    actorId: session?.userId,
+    actorEmail: session?.userEmail ?? undefined,
+    tenantId: session?.tenantId ?? undefined,
+    action: record.action,
+    targetType: record.targetType,
+    targetId: record.targetId,
+    outcome: 'success',
+    requestId: c.req.header('cf-ray') ?? generateRequestId(),
+  });
+  await c.env.DB.batch([...stmts, auditStmt]);
+}
+
+/** Uniform error page for a failed audited mutation (data change rolled back). */
+function auditedMutationError(c: any, _err: unknown, message: string): Response {
+  // The error object is NEVER serialized to logs or responses: it can embed
+  // R2 keys or other sensitive values. Diagnostics live in media_ops.error_code.
+  console.error(JSON.stringify({ event: 'admin.mutation.error', message }));
+  const accept = c.req.header('accept') || '';
+  if (accept.includes('application/json')) {
+    return c.json({ success: false, error: message }, 500);
+  }
+  return c.html(
+    pageShell(
+      'Error',
+      `<div class="flex items-center justify-center min-h-screen">
+        <div class="text-center p-8">
+          <h1 class="text-xl font-bold text-red-600 mb-2">${escHtml(message)}<\/h1>
+          <a href="/admin" class="text-indigo-600 underline">Go back<\/a>
+        <\/div>
+      <\/div>`
+    ),
+    500
+  );
+}
+
+/** Trusted actor/request context captured once per request for outbox audit rows. */
+function actorContext(c: any): { actorId: string | null; actorEmail: string | null; tenantId: string | null; requestId: string } {
+  const session = c.get('session') as Session | undefined;
+  return {
+    actorId: session?.userId ?? null,
+    actorEmail: session?.userEmail ?? null,
+    tenantId: session?.tenantId ?? null,
+    requestId: c.req.header('cf-ray') ?? generateRequestId(),
+  };
+}
+
+/** Media-ops reconciliation requires a validated admin/broker session (role check on top of the /admin mount). */
+function requireMediaRole(c: any): boolean {
+  const session = c.get('session') as Session | undefined;
+  return Boolean(session && (session.role === 'admin' || session.role === 'broker'));
+}
+
+/** Idempotency key for duplicate-submission dedup: X-Idempotency-Key header or _idem form field. */
+async function idempotencyKeyOf(c: any, form?: FormData): Promise<string | null> {
+  const header = c.req.header('x-idempotency-key');
+  if (typeof header === 'string' && header.length > 0 && header.length <= 200) return header;
+  const contentType = c.req.header('content-type') || '';
+  if (form) {
+    const f = form.get('_idem');
+    if (typeof f === 'string' && f.length > 0 && f.length <= 200) return f;
+  } else if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
+    try {
+      const f = await c.req.formData();
+      const v = f.get('_idem');
+      if (typeof v === 'string' && v.length > 0 && v.length <= 200) return v;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Upload a media object via the durable outbox: stage the body under a unique
+ * staging key, then apply_upload (copy to final key + point the event column +
+ * audit atomically). The apply is guarded by the operation's expectedRef: if
+ * the field changed since creation the op becomes superseded and never
+ * overwrites a newer reference. Duplicate submissions with the same idemKey
+ * reuse the existing group instead of competing.
+ */
+async function uploadMedia(
+  c: any,
+  file: File,
+  key: string,
+  targetEventId: string,
+  targetColumn: string,
+  auditAction: string,
+  contentType: string,
+  oldKey: string | null,
+  expectedRef: string | null,
+  idemKey: string | null,
+  redirectPath: string
+): Promise<Response> {
+  if (!(SAFE_COLUMNS as readonly string[]).includes(targetColumn)) {
+    return auditedMutationError(c, new Error('invalid target'), 'Media update failed');
+  }
+  const actor = actorContext(c);
+  try {
+    if (idemKey) {
+      const existing = await findMediaGroupByKey(c.env.DB, idemKey);
+      if (existing) return c.redirect(redirectPath);
+    }
+    const stagingKey = `staging/${generateId()}`;
+    await c.env.BUCKET.put(stagingKey, file.stream(), { httpMetadata: { contentType } });
+
+    const ops: MediaOpInput[] = [
+      {
+        action: 'apply_upload',
+        key,
+        stagingKey,
+        targetType: 'event',
+        targetEventId,
+        targetColumn,
+        expectedRef,
+        intendedRef: key,
+        idempotencyKey: idemKey ?? undefined,
+        tenantId: actor.tenantId,
+        auditAction,
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      },
+    ];
+    if (oldKey) {
+      ops.push({
+        action: 'delete',
+        key: oldKey,
+        targetType: 'event',
+        expectedRef: oldKey,
+        intendedRef: null,
+        tenantId: actor.tenantId,
+        auditAction,
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      });
+    }
+
+    const groupId = await enqueueMediaOps(c.env.DB, ops, idemKey ?? undefined);
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Media update failed');
+    return c.redirect(redirectPath);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Media update failed');
+  }
+}
+
+/**
+ * Clear an event media column via the durable outbox: the DB ref change, its
+ * audit row, and the R2 delete record(s) commit in ONE batch; the R2 deletes
+ * then run idempotently (refcount-guarded). Never reports success unless the
+ * D1 change, audit row, and R2 deletes all complete. Duplicate submissions
+ * with the same idemKey reuse the existing group.
+ */
+async function deleteEventMedia(
+  c: any,
+  adminToken: string,
+  eventId: string,
+  targetColumn: string,
+  auditAction: string,
+  keys: (string | null | undefined)[],
+  expectedRef: string | null,
+  idemKey: string | null
+): Promise<Response> {
+  if (!(SAFE_COLUMNS as readonly string[]).includes(targetColumn)) {
+    return auditedMutationError(c, new Error('invalid target'), 'Media delete failed');
+  }
+  const actor = actorContext(c);
+  const toDelete = keys.filter((k): k is string => Boolean(k));
+  const stmt = c.env.DB.prepare(
+    `UPDATE events SET ${targetColumn} = NULL, updated_at = ? WHERE id = ? AND tenant_id = ?`
+  ).bind(new Date().toISOString(), eventId, sessionTenant(c));
+  try {
+    if (toDelete.length === 0) {
+      await commitAudited(c, { action: auditAction, targetType: 'event', targetId: eventId }, [stmt]);
+      return c.redirect(`/admin/events/${adminToken}`);
+    }
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      [stmt],
+      {
+        action: auditAction,
+        targetType: 'event',
+        targetId: eventId,
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      toDelete.map((key) => ({
+        action: 'delete' as const,
+        key,
+        targetType: 'event',
+        expectedRef,
+        intendedRef: null,
+        tenantId: actor.tenantId,
+        auditAction,
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      })),
+      idemKey ?? undefined
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Media delete failed');
+  } catch (err) {
+    return auditedMutationError(c, err, 'Media delete failed');
+  }
+  return c.redirect(`/admin/events/${adminToken}`);
 }
 
 async function hashPassword(password: string): Promise<string> {
@@ -105,23 +552,6 @@ function getEventStatus(event: Event, now: Date): string {
   if (now < start) return 'scheduled';
   if (now >= start && now <= end) return 'happening_now';
   return 'ended';
-}
-
-async function deleteR2FileIfUnreferenced(c: any, key: string | null | undefined): Promise<void> {
-  if (!key) return;
-  try {
-    const check = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM events WHERE photo_key = ? OR agent_photo_key = ? OR agent_photo_2_key = ? OR flyer_key = ?'
-    )
-      .bind(key, key, key, key)
-      .first() as any;
-
-    if (check && check.count <= 1) {
-      await c.env.BUCKET.delete(key);
-    }
-  } catch (err) {
-    console.error(`Error in deleteR2FileIfUnreferenced for key ${key}:`, err);
-  }
 }
 
 function formatBytes(bytes: number): string {
@@ -376,47 +806,117 @@ function agentNav(agentName: string, companyName: string | null, extra = ''): st
 // App
 // ---------------------------------------------------------------------------
 
-const app = new Hono<{ Bindings: Bindings }>();
+const app = new Hono<{ Bindings: Bindings; Variables: { session: Session } }>();
 
 // ---------------------------------------------------------------------------
-// Middleware: Setup & Auth
+// EMERGENCY CONTAINMENT: admin routes disabled pending authentication fix.
+// Must remain the first middleware so it runs before any authorization logic
+// or route handler. Denies unconditionally; no cookie is read or trusted.
 // ---------------------------------------------------------------------------
 
 app.use('*', async (c, next) => {
+  // Local/CI tests and the verified production config set
+  // CONTAINMENT_ENABLED=false to exercise the authenticated handlers. Any
+  // other value keeps the emergency 503 guard active.
+  if (c.env.CONTAINMENT_ENABLED === 'false') {
+    return await next();
+  }
+
   const path = c.req.path;
 
-  // Always allow API and static-ish routes
+  if (path === '/admin' || path.startsWith('/admin/')) {
+    emitLog({
+      event: 'admin.containment.denied',
+      outcome: 'denied',
+      route: '/admin',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.body('Admin temporarily unavailable', 503, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Retry-After': '3600',
+    });
+  }
+
+  return await next();
+});
+
+// ---------------------------------------------------------------------------
+// Middleware: Setup, SSO callback & admin auth/CSRF
+// ---------------------------------------------------------------------------
+
+// Broad setup/SSO gate: runs for every non-API request. Handles the SSO
+// callback (exchanging the one-time token for a local D1 session) and the
+// first-admin setup redirects. It does NOT itself authorize /admin paths —
+// the dedicated admin middleware below does that with a validated session.
+app.use('*', async (c, next) => {
+  const path = c.req.path;
+
+  // Always allow API routes
   if (path.startsWith('/api/')) {
     return await next();
   }
 
-  // Check if any admin exists
+  // SSO callback: exchange the one-time token server-to-server and create a
+  // local D1 session. Exempt from CSRF because it is authenticated by the
+  // Workspace token exchange, not by a cookie. On failure we never fall
+  // through into an authenticated /admin request.
+  const ssoToken = c.req.query('sso_token');
+  if (ssoToken) {
+    const workspaceUrl = c.env.WORKSPACE_URL || 'https://workspace.primeamericany.com';
+    const result = await completeSsoLogin(c.env.DB, workspaceUrl, ssoToken, c.req.url);
+    if (result) {
+      setCookie(c, SESSION_COOKIE, result.sessionToken, {
+        path: '/',
+        httpOnly: true,
+        secure: true,
+        sameSite: 'Lax',
+        maxAge: ABSOLUTE_TTL_SECONDS,
+      });
+      // Legacy cookies are dead; clear them so nothing trusts them again.
+      for (const name of ['admin_session', 'openhouse_user']) {
+        setCookie(c, name, '', { path: '/', httpOnly: true, secure: true, sameSite: 'Lax', maxAge: 0 });
+      }
+      emitLog({
+        event: 'admin.auth.success',
+        outcome: 'success',
+        route: path,
+        requestId: c.req.header('cf-ray') ?? generateRequestId(),
+        actorId: result.actorId,
+        tenantId: result.tenantId ?? undefined,
+        clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+      });
+      return c.redirect(result.redirectTo);
+    }
+    if (path === '/admin' || path.startsWith('/admin/')) {
+      emitLog({
+        event: 'admin.auth.failure',
+        outcome: 'denied',
+        route: path,
+        requestId: c.req.header('cf-ray') ?? generateRequestId(),
+        clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+      });
+      return c.text('Sign-in failed', 401);
+    }
+  }
+
+  // First-admin setup flow.
   const { results } = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').all();
   const adminExists = results && results.length > 0;
 
   if (!adminExists) {
-    // If no admin, only allow /setup
     if (path !== '/setup') {
       return c.redirect('/setup');
     }
   } else {
-    // Admin exists: Disable /setup
     if (path === '/setup') {
       return c.redirect('/admin');
     }
 
-    // Protect /admin routes
-    if (path.startsWith('/admin')) {
-      const sessionId = getCookie(c, 'admin_session');
-      if (!sessionId) {
-        return c.redirect('/login');
-      }
-    }
-
-    // Redirect /login to /admin if already logged in
     if (path === '/login') {
-      const sessionId = getCookie(c, 'admin_session');
-      if (sessionId) {
+      const session = await validateSession(c.env.DB, getCookie(c, SESSION_COOKIE) ?? '');
+      if (session) {
         return c.redirect('/admin');
       }
     }
@@ -425,7 +925,247 @@ app.use('*', async (c, next) => {
   await next();
 });
 
+// Dedicated /admin gate: server-side session validation plus CSRF. Runs only
+// once the broad gate above has satisfied setup/SSO conditions.
+function approvedOrigin(c: any): string {
+  return c.env.APP_URL || 'https://openhouse.primeamericarealestate.com';
+}
+
+async function adminRequireAuth(c: any, next: any): Promise<Response | void> {
+  const rawToken = getCookie(c, SESSION_COOKIE);
+  const session = await validateSession(c.env.DB, rawToken ?? '');
+  if (!session) {
+    const requestId = c.req.header('cf-ray') ?? generateRequestId();
+    emitLog({
+      event: 'admin.auth.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId,
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    // Denied-auth attempts are logged, not persisted to admin_audit: the
+    // audit table records only mutations/outcomes that were authorized.
+    // Browser navigations get redirected to the Workspace SSO; everything
+    // else (fetch/XHR/forms) gets a plain 401.
+    const isHtmlNav = c.req.method === 'GET' && (c.req.header('accept') || '').includes('text/html');
+    if (isHtmlNav) {
+      if (c.env.WORKSPACE_URL) {
+        const loginUrl = new URL(`${c.env.WORKSPACE_URL}/api/sso/redirect`);
+        loginUrl.searchParams.set('app', 'openhouse');
+        const clean = new URL(c.req.url);
+        clean.searchParams.delete('sso_token');
+        loginUrl.searchParams.set('return_to', clean.toString());
+        return c.redirect(loginUrl.toString());
+      }
+      return c.redirect('/login');
+    }
+    return c.json({ success: false, error: 'Authentication required' }, 401);
+  }
+  c.set('session', session);
+  return await next();
+}
+
+async function adminRequireCsrf(c: any, next: any): Promise<Response | void> {
+  const method = c.req.method.toUpperCase();
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    return await next();
+  }
+
+  const requestId = c.req.header('cf-ray') ?? generateRequestId();
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId,
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
+  const session = c.get('session') as Session;
+  const submitted = await extractCsrfToken(c.req.raw);
+  if (!submitted || !safeEqual(submitted, session.csrfToken)) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId,
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid CSRF token' }, 403);
+  }
+
+  return await next();
+}
+
+// Fail-closed tenant gate. Every admin request must carry a validated
+// server-side session that includes a tenant ID; otherwise the request is
+// rejected outright (no default-tenant fallback).
+async function adminRequireTenant(c: any, next: any): Promise<Response | void> {
+  const session = c.get('session') as Session | undefined;
+  if (!session?.tenantId) {
+    emitLog({
+      event: 'admin.tenant.denied',
+      outcome: 'denied',
+      route: c.req.path,
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    if (c.req.method === 'GET' && (c.req.header('accept') || '').includes('text/html')) {
+      return c.redirect('/login');
+    }
+    return c.json({ success: false, error: 'Forbidden: no validated tenant' }, 403);
+  }
+  return await next();
+}
+
+// Inject the session-bound CSRF token into admin HTML pages so their forms
+// and fetch calls carry _csrf / X-CSRF-Token automatically.
+async function adminInjectCsrf(c: any, next: any): Promise<Response | void> {
+  await next();
+  if (c.req.method !== 'GET') return;
+  const contentType = c.res.headers.get('content-type') || '';
+  if (!contentType.includes('text/html')) return;
+
+  const session = c.get('session') as Session | undefined;
+  if (!session) return;
+
+  const snippet = `
+  <meta name="csrf-token" content="${escAttr(session.csrfToken)}" />
+  <script>
+  (function() {
+    var token = (document.querySelector('meta[name="csrf-token"]') || {}).getAttribute('content');
+    if (!token) return;
+    // Per-page idempotency key: duplicate submissions of the same form/fetch
+    // reuse one media operation instead of creating competing ones.
+    var idemKey = 'idem-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    function injectFormTokens() {
+      document.querySelectorAll('form[method="post" i]').forEach(function(f) {
+        if (f.querySelector('input[name="_csrf"]')) return;
+        var i = document.createElement('input');
+        i.type = 'hidden';
+        i.name = '_csrf';
+        i.value = token;
+        f.appendChild(i);
+        if (!f.querySelector('input[name="_idem"]')) {
+          var d = document.createElement('input');
+          d.type = 'hidden';
+          d.name = '_idem';
+          d.value = idemKey;
+          f.appendChild(d);
+        }
+      });
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', injectFormTokens);
+    } else {
+      injectFormTokens();
+    }
+    var origFetch = window.fetch;
+    window.fetch = function(input, init) {
+      var url = typeof input === 'string' ? input : (input && input.url) || '';
+      var method = String(((init && init.method) || (input && input.method) || 'GET')).toUpperCase();
+      if (method !== 'GET' && url.indexOf(location.origin) === 0) {
+        init = init || {};
+        init.headers = init.headers || {};
+        if (init.headers instanceof Headers) init.headers.set('X-CSRF-Token', token);
+        else init.headers['X-CSRF-Token'] = token;
+        if (init.headers instanceof Headers) init.headers.set('X-Idempotency-Key', idemKey);
+        else init.headers['X-Idempotency-Key'] = idemKey;
+      }
+      return origFetch.call(this, input, init);
+    };
+  })();
+  </script>`;
+
+  const html = await c.res.text();
+  const injected = html.includes('</head>') ? html.replace('</head>', snippet + '\n</head>') : snippet + html;
+  c.res = new Response(injected, c.res);
+}
+
+app.use('/admin', adminRequireAuth, adminRequireTenant, adminRequireCsrf, adminInjectCsrf);
+app.use('/admin/*', adminRequireAuth, adminRequireTenant, adminRequireCsrf, adminInjectCsrf);
+
 app.get('/', (c) => c.redirect('/admin'));
+
+// ---------------------------------------------------------------------------
+// Internal Server-to-Server API — Workspace integration
+// ---------------------------------------------------------------------------
+// GET /api/events/list
+// Called by the Workspace worker proxy (/api/openhouses) using
+// Authorization: Bearer <INTERNAL_API_SECRET>.  Never user-facing.
+app.post('/api/attendance-capture', c => captureOfflineAttendance(c.req.raw, c.env));
+
+app.get('/api/events/list', async (c) => {
+  // Validate internal secret
+  const authHeader = c.req.header('Authorization') || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const secret = (c.env as any).INTERNAL_API_SECRET as string | undefined;
+  if (!secret || !token || token !== secret) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    const now = new Date().toISOString();
+    const tenantId = c.req.header('X-Tenant-Id')?.trim();
+    if (!tenantId) return c.json({error:'Tenant context required'},403);
+    const result = await c.env.DB
+      .prepare(
+        `SELECT id, tenant_id, listing_id, property_id, agent_user_id, professional_license_id,
+                title, property_address, agent_name, agent_email, agent_phone,
+                start_time, end_time, timezone, listing_url, photo_key, status,
+                public_token, rsvp_token, created_at, updated_at
+           FROM events
+          WHERE deleted_at IS NULL
+            AND tenant_id = ?
+          ORDER BY start_time DESC
+          LIMIT 100`
+      )
+      .bind(tenantId)
+      .all<Event>();
+
+    const events = (result.results || []).map((ev) => {
+      const start = new Date(ev.start_time);
+      const end = new Date(ev.end_time);
+      const nowDate = new Date(now);
+      let computedStatus = ev.status;
+      if (ev.status !== 'cancelled' && ev.status !== 'achieved') {
+        if (nowDate < start) computedStatus = 'scheduled';
+        else if (nowDate >= start && nowDate <= end) computedStatus = 'happening_now';
+        else computedStatus = 'ended';
+      }
+      return {
+        id: ev.id,
+        tenant_id: ev.tenant_id,
+        listing_id: ev.listing_id,
+        property_id: ev.property_id,
+        agent_user_id: ev.agent_user_id,
+        professional_license_id: ev.professional_license_id,
+        title: ev.title,
+        property_address: ev.property_address,
+        agent_name: ev.agent_name,
+        agent_email: ev.agent_email,
+        agent_phone: ev.agent_phone,
+        start_time: ev.start_time,
+        end_time: ev.end_time,
+        timezone: ev.timezone,
+        listing_url: ev.listing_url,
+        photo_key: ev.photo_key,
+        status: computedStatus,
+        public_token: ev.public_token,
+        rsvp_token: ev.rsvp_token,
+        created_at: ev.created_at,
+        updated_at: ev.updated_at,
+      };
+    });
+
+    return c.json({ events });
+  } catch (err: any) {
+    console.error('[api/events/list]', err?.message ?? err);
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Setup Flow
@@ -474,6 +1214,20 @@ app.get('/setup', async (c) => {
 });
 
 app.post('/setup', async (c) => {
+  // Pre-session origin check: /setup and /login run before any admin session
+  // exists, so they cannot rely on a CSRF token. Same strict origin policy
+  // as every other state-changing route applies here.
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: '/setup',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
   const { results } = await c.env.DB.prepare('SELECT id FROM admins LIMIT 1').all();
   if (results && results.length > 0) {
     return c.redirect('/admin');
@@ -498,12 +1252,19 @@ app.post('/setup', async (c) => {
     .bind(id, username, passwordHash, name, now)
     .run();
 
-  setCookie(c, 'admin_session', id, {
+  const sessionToken = await createSession(c.env.DB, {
+    userId: id,
+    role: 'admin',
+    userEmail: username,
+    userName: name,
+    tenantId: (c.env.ADMIN_TENANT_ID as string | undefined) ?? null,
+  });
+  setCookie(c, SESSION_COOKIE, sessionToken, {
     path: '/',
     httpOnly: true,
     secure: true,
     sameSite: 'Lax',
-    maxAge: 60 * 60 * 24 * 7,
+    maxAge: ABSOLUTE_TTL_SECONDS,
   });
 
   return c.redirect('/admin');
@@ -552,6 +1313,19 @@ app.get('/login', (c) => {
 });
 
 app.post('/login', async (c) => {
+  // Pre-session origin check: no session/CSRF token exists yet, so validate
+  // the Origin/Referer directly (same policy as all state-changing routes).
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: '/login',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
   const form = await c.req.formData();
   const username = (form.get('username') as string)?.trim();
   const password = (form.get('password') as string);
@@ -565,12 +1339,19 @@ app.post('/login', async (c) => {
     .first<Admin>();
 
   if (admin && admin.password_hash === await hashPassword(password)) {
-    setCookie(c, 'admin_session', admin.id, {
+    const sessionToken = await createSession(c.env.DB, {
+      userId: admin.id,
+      role: 'admin',
+      userEmail: admin.username,
+      userName: admin.name,
+      tenantId: (c.env.ADMIN_TENANT_ID as string | undefined) ?? null,
+    });
+    setCookie(c, SESSION_COOKIE, sessionToken, {
       path: '/',
       httpOnly: true,
       secure: true,
       sameSite: 'Lax',
-      maxAge: 60 * 60 * 24 * 7, // 1 week
+      maxAge: ABSOLUTE_TTL_SECONDS,
     });
     return c.redirect('/admin');
   }
@@ -586,10 +1367,33 @@ app.post('/login', async (c) => {
 });
 
 app.post('/logout', async (c) => {
-  setCookie(c, 'admin_session', '', {
-    path: '/',
-    maxAge: 0,
-  });
+  // Origin check: POST /logout is a state change. It does not require a CSRF
+  // token (there is no session to bind one to when the session is invalid),
+  // but it must come from the approved origin to be a usable CSRF vector.
+  if (!isApprovedOrigin(c.req.raw, approvedOrigin(c))) {
+    emitLog({
+      event: 'admin.csrf.denied',
+      outcome: 'denied',
+      route: '/logout',
+      requestId: c.req.header('cf-ray') ?? generateRequestId(),
+      clientCountry: c.req.header('cf-ipcountry') ?? undefined,
+    });
+    return c.json({ success: false, error: 'Forbidden: invalid origin' }, 403);
+  }
+
+  const rawToken = getCookie(c, SESSION_COOKIE);
+  if (rawToken) {
+    await revokeSession(c.env.DB, rawToken);
+  }
+  for (const name of [SESSION_COOKIE, 'admin_session', 'openhouse_user']) {
+    setCookie(c, name, '', {
+      path: '/',
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+      maxAge: 0,
+    });
+  }
   return c.redirect('/login');
 });
 
@@ -711,7 +1515,7 @@ app.get('/e/:token', async (c) => {
           <p class="text-gray-500 text-sm mt-1">Please sign in &mdash; we&rsquo;d love to stay in touch<\/p>
           <div class="divider mt-4"><\/div>
         <\/div>
-        <form method="POST" action="/e/${escHtml(token)}/signin" class="space-y-4">
+        <form method="POST" action="/e/${escHtml(token)}/signin" class="space-y-4" onsubmit="var b=document.getElementById('signin-submit-btn');if(b){b.disabled=true;b.innerText='Signing In...';b.classList.add('opacity-75');}">
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">First Name <span class="text-red-400">*<\/span><\/label>
@@ -778,8 +1582,18 @@ app.get('/e/:token', async (c) => {
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
               placeholder="Anything you&rsquo;d like the agent to know&hellip;"><\/textarea>
           <\/div>
+          <div class="space-y-2 rounded-xl bg-gray-50 p-3 text-xs text-gray-600">
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_contact" value="1" required class="mt-0.5" style="accent-color:var(--gold)" \/>
+              <span>I agree that the event&rsquo;s real estate professional may contact me about this property and my visit. <span class="text-red-400">*<\/span><\/span>
+            <\/label>
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_marketing" value="1" class="mt-0.5" style="accent-color:var(--gold)" \/>
+              <span>I would also like occasional real estate updates and marketing messages. Optional.<\/span>
+            <\/label>
+          <\/div>
           <div class="pt-1">
-            <button type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
+            <button id="signin-submit-btn" type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
               &#10003; &nbsp;Sign In to Open House
             <\/button>
           <\/div>
@@ -873,16 +1687,30 @@ app.post('/e/:token/signin', async (c) => {
   const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const howDidYouHear = (form.get('how_did_you_hear') as string | null)?.trim() || null;
   const notes = (form.get('notes') as string | null)?.trim() || null;
+  const consentContact = form.get('consent_contact') === '1' ? 1 : 0;
+  const consentMarketing = form.get('consent_marketing') === '1' ? 1 : 0;
+
+  if (!consentContact) {
+    return c.html(guestPageShell('Consent Required', '<div class="flex items-center justify-center min-h-screen p-8"><div class="glass-card rounded-2xl p-8 text-center"><h1 class="text-lg font-bold mb-2">Consent is required<\/h1><p class="text-gray-500 text-sm">Please agree to property-specific contact so the hosting professional can follow up about your visit.<\/p><\/div><\/div>'), 400);
+  }
 
   const guestId = generateId();
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, address, is_agent, how_did_you_hear, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, address, is_agent,
+       how_did_you_hear, notes, signed_in_at, follow_up_status, consent_contact, consent_marketing,
+       consent_captured_at, crm_sync_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 'pending')`
   )
-    .bind(guestId, event.id, firstName, lastName, email, phone, address, isAgent, howDidYouHear, notes, now)
+    .bind(guestId, event.id, firstName, lastName, email, phone, address, isAgent, howDidYouHear, notes, now,
+      consentContact, consentMarketing, now)
     .run();
+
+  await syncGuestToCrm(c, event, {
+    id: guestId, firstName, lastName, email, phone, address, notes,
+    consentMarketing, consentCapturedAt: now, occurredAt: now,
+  });
 
   return c.redirect(`/e/${token}/success`);
 });
@@ -992,8 +1820,10 @@ app.get('/admin', async (c) => {
   if (filter === 'deleted') {
     // Trash tab: soft-deleted events
     const trashedEvents = await c.env.DB.prepare(
-      'SELECT * FROM events WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
-    ).all<Event>();
+      'SELECT * FROM events WHERE deleted_at IS NOT NULL AND tenant_id = ? ORDER BY deleted_at DESC'
+    )
+      .bind(sessionTenant(c))
+      .all<Event>();
 
     const trashedCards = (trashedEvents.results ?? [])
       .map((ev) => {
@@ -1068,12 +1898,16 @@ function filterEvents(q) {
 
   // Normal tabs: exclude soft-deleted events
   const eventsResult = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE deleted_at IS NULL ORDER BY start_time DESC'
-  ).all<Event>();
+    'SELECT * FROM events WHERE deleted_at IS NULL AND tenant_id = ? ORDER BY start_time DESC'
+  )
+    .bind(sessionTenant(c))
+    .all<Event>();
 
   const deletedCountResult = await c.env.DB.prepare(
-    'SELECT COUNT(*) as cnt FROM events WHERE deleted_at IS NOT NULL'
-  ).first<{ cnt: number }>();
+    'SELECT COUNT(*) as cnt FROM events WHERE deleted_at IS NOT NULL AND tenant_id = ?'
+  )
+    .bind(sessionTenant(c))
+    .first<{ cnt: number }>();
   const deletedCount = deletedCountResult?.cnt ?? 0;
 
   const allEvents = (eventsResult.results ?? []).map((ev) => ({
@@ -1107,6 +1941,8 @@ function filterEvents(q) {
     url: `/admin/events/${ev.admin_token}`,
   }));
 
+  const userSession = getUserSession(c);
+
   const gridCards = filtered
     .map(({ ev, liveStatus }) => {
       const photoUrl = ev.photo_key
@@ -1117,6 +1953,8 @@ function filterEvents(q) {
       const rsvpCount = a?.rsvp_count ?? 0;
       const checkedIn = a?.checked_in_count ?? 0;
       const searchText = (ev.title + ' ' + ev.property_address + ' ' + ev.agent_name + ' ' + (ev.company_name ?? '')).toLowerCase();
+      const canManage = isUserAssignedToEvent(userSession, ev);
+
       return `
       <div class="bg-white rounded-xl shadow hover:shadow-md transition-shadow border border-gray-100 overflow-hidden"
            data-search="${escAttr(searchText)}">
@@ -1146,15 +1984,20 @@ function filterEvents(q) {
             <\/div>
           <\/div>
           <div class="flex items-center gap-2 flex-wrap">
-            <a href="/admin/events/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#9998; Manage<\/a>
-            <a href="/agent/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128100; Agent<\/a>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/duplicate" class="inline">
-              <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Copy<\/button>
-            <\/form>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
-              onsubmit="return confirm('Move this event to Trash?')">
-              <button type="submit" class="inline-flex items-center gap-1 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465;<\/button>
-            <\/form>
+            ${canManage ? `
+              <a href="/admin/events/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#9998; Manage<\/a>
+              <a href="/agent/${escHtml(ev.admin_token)}" class="inline-flex items-center gap-1 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128100; Agent<\/a>
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/duplicate" class="inline">
+                <button type="submit" class="inline-flex items-center gap-1 bg-green-50 hover:bg-green-100 text-green-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#10064; Copy<\/button>
+              <\/form>
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
+                onsubmit="return confirm('Move this event to Trash?')">
+                <button type="submit" class="inline-flex items-center gap-1 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128465;<\/button>
+              <\/form>
+            ` : `
+              <a href="/e/${escHtml(ev.public_token)}" target="_blank" class="inline-flex items-center gap-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">&#128065; Sign-In Page<\/a>
+              <span class="text-xs text-gray-400 italic">Public View (Assigned to ${escHtml(ev.agent_name)})<\/span>
+            `}
           <\/div>
         <\/div>
       <\/div>`;
@@ -1167,6 +2010,8 @@ function filterEvents(q) {
       const totalGuests = a?.total ?? 0;
       const rsvpCount = a?.rsvp_count ?? 0;
       const searchText = (ev.title + ' ' + ev.property_address + ' ' + ev.agent_name + ' ' + (ev.company_name ?? '')).toLowerCase();
+      const canManage = isUserAssignedToEvent(userSession, ev);
+
       return `
       <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0"
           data-search="${escAttr(searchText)}">
@@ -1183,12 +2028,16 @@ function filterEvents(q) {
         <\/td>
         <td class="px-4 py-3">
           <div class="flex items-center gap-2 flex-wrap">
-            <a href="/admin/events/${escHtml(ev.admin_token)}" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded-lg">&#9998; Manage<\/a>
-            <a href="/agent/${escHtml(ev.admin_token)}" class="bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-2 py-1 rounded-lg">Agent<\/a>
-            <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
-              onsubmit="return confirm('Move this event to Trash?')">
-              <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-2 py-1 rounded-lg">&#128465;<\/button>
-            <\/form>
+            ${canManage ? `
+              <a href="/admin/events/${escHtml(ev.admin_token)}" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded-lg">&#9998; Manage<\/a>
+              <a href="/agent/${escHtml(ev.admin_token)}" class="bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs font-medium px-2 py-1 rounded-lg">Agent<\/a>
+              <form method="POST" action="/admin/events/${escHtml(ev.admin_token)}/delete" class="inline"
+                onsubmit="return confirm('Move this event to Trash?')">
+                <button type="submit" class="bg-red-50 hover:bg-red-100 text-red-700 text-xs font-medium px-2 py-1 rounded-lg">&#128465;<\/button>
+              <\/form>
+            ` : `
+              <a href="/e/${escHtml(ev.public_token)}" target="_blank" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-medium px-2 py-1 rounded-lg">&#128065; Public View<\/a>
+            `}
           <\/div>
         <\/td>
       <\/tr>`;
@@ -1335,8 +2184,8 @@ app.get('/admin/storage/info', async (c) => {
       formattedLimit: '20 GB',
       percentage: Math.min(100, parseFloat(percentage.toFixed(2))),
     });
-  } catch (err: any) {
-    return c.json({ success: false, error: err.message }, 500);
+  } catch {
+    return c.json({ success: false, error: 'Storage info unavailable' }, 500);
   }
 });
 
@@ -1353,16 +2202,18 @@ app.get('/admin/storage', async (c) => {
       }
       cursor = list.truncated ? list.cursor : undefined;
     } while (cursor);
-  } catch (err) {
-    console.error('R2 list error:', err);
+  } catch {
+    console.error(JSON.stringify({ event: 'admin.storage.list.error' }));
   }
 
   const limitBytes = 20 * 1024 * 1024 * 1024; // 20 GB
   const percentage = Math.min(100, (totalSize / limitBytes) * 100);
 
   const events = await c.env.DB.prepare(
-    'SELECT id, title, admin_token, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events'
-  ).all<Event>();
+    'SELECT id, title, admin_token, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events WHERE tenant_id = ?'
+  )
+    .bind(sessionTenant(c))
+    .all<Event>();
   
   const refMap = new Map<string, { eventTitle: string; role: string; adminToken: string }>();
   for (const ev of events.results ?? []) {
@@ -1587,15 +2438,36 @@ app.get('/admin/storage', async (c) => {
 app.post('/admin/storage/delete', async (c) => {
   const form = await c.req.formData();
   const key = form.get('key') as string | null;
-  if (key) {
-    await c.env.BUCKET.delete(key).catch((err: unknown) => {
-      console.error('R2 delete error:', err);
-    });
+  if (!key) return c.redirect('/admin/storage');
+  const idemKey = await idempotencyKeyOf(c, form);
 
-    await c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key).run();
-    await c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key).run();
-    await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key).run();
-    await c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key).run();
+  const actor = actorContext(c);
+  try {
+    const stmts = [
+      c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key),
+      c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key),
+      c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key),
+      c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key),
+    ];
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      stmts,
+      {
+        action: 'admin.storage.delete',
+        targetType: 'storage',
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      [{ action: 'delete', key, targetType: 'storage', expectedRef: key, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.storage.delete', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+      idemKey ?? undefined
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Storage delete failed');
+  } catch (err) {
+    return auditedMutationError(c, err, 'Storage delete failed');
   }
   return c.redirect('/admin/storage');
 });
@@ -1603,22 +2475,55 @@ app.post('/admin/storage/delete', async (c) => {
 app.post('/admin/storage/bulk-delete', async (c) => {
   const form = await c.req.formData();
   const keysStr = form.get('keys') as string | null;
-  if (keysStr) {
-    try {
-      const keys = JSON.parse(keysStr) as string[];
-      for (const key of keys) {
-        await c.env.BUCKET.delete(key).catch((err: unknown) => {
-          console.error('R2 delete error for key ' + key + ':', err);
-        });
+  if (!keysStr) return c.redirect('/admin/storage');
+  const idemKey = await idempotencyKeyOf(c, form);
 
-        await c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key).run();
-        await c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key).run();
-        await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key).run();
-        await c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key).run();
-      }
-    } catch (err) {
-      console.error('Bulk delete parse error:', err);
+  let keys: string[];
+  try {
+    keys = JSON.parse(keysStr) as string[];
+  } catch {
+    return c.redirect('/admin/storage');
+  }
+
+  const actor = actorContext(c);
+  try {
+    const stmts: D1PreparedStatement[] = [];
+    for (const key of keys) {
+      stmts.push(c.env.DB.prepare('UPDATE events SET photo_key = NULL WHERE photo_key = ?').bind(key));
+      stmts.push(c.env.DB.prepare('UPDATE events SET agent_photo_key = NULL WHERE agent_photo_key = ?').bind(key));
+      stmts.push(c.env.DB.prepare('UPDATE events SET agent_photo_2_key = NULL WHERE agent_photo_2_key = ?').bind(key));
+      stmts.push(c.env.DB.prepare('UPDATE events SET flyer_key = NULL WHERE flyer_key = ?').bind(key));
     }
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      stmts,
+      {
+        action: 'admin.storage.bulk_delete',
+        targetType: 'storage',
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      keys.map((key) => ({
+        action: 'delete' as const,
+        key,
+        targetType: 'storage',
+        expectedRef: key,
+        intendedRef: null,
+        tenantId: actor.tenantId,
+        auditAction: 'admin.storage.bulk_delete',
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      })),
+      idemKey ?? undefined
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Bulk delete failed');
+  } catch (err) {
+    return auditedMutationError(c, err, 'Bulk delete failed');
   }
   return c.redirect('/admin/storage');
 });
@@ -1631,29 +2536,64 @@ app.post('/admin/storage/rename', async (c) => {
   const form = await c.req.formData();
   const oldKey = form.get('oldKey') as string | null;
   const newKey = form.get('newKey') as string | null;
-  
+  const idemKey = await idempotencyKeyOf(c, form);
+
   if (oldKey && newKey && oldKey !== newKey) {
+    if (idemKey) {
+      const existing = await findMediaGroupByKey(c.env.DB, idemKey);
+      if (existing) return c.redirect('/admin/storage');
+    }
+    const actor = actorContext(c);
+    const oldObj = await c.env.BUCKET.get(oldKey).catch(() => null);
+    if (!oldObj) {
+      return c.text('Source file not found', 404);
+    }
+
+    // Copy is the one R2 write that must precede the DB repoint. If it fails,
+    // nothing was created and no references changed; the request fails cleanly.
     try {
-      const oldObj = await c.env.BUCKET.get(oldKey);
-      if (!oldObj) {
-        return c.text('Source file not found', 404);
-      }
-      
       await c.env.BUCKET.put(newKey, oldObj.body, {
         httpMetadata: oldObj.httpMetadata,
-        customMetadata: oldObj.customMetadata
+        customMetadata: oldObj.customMetadata,
       });
-      
-      await c.env.BUCKET.delete(oldKey);
+    } catch {
+      return c.text('Rename failed', 500);
+    }
 
-      await c.env.DB.prepare('UPDATE events SET photo_key = ? WHERE photo_key = ?').bind(newKey, oldKey).run();
-      await c.env.DB.prepare('UPDATE events SET agent_photo_key = ? WHERE agent_photo_key = ?').bind(newKey, oldKey).run();
-      await c.env.DB.prepare('UPDATE events SET agent_photo_2_key = ? WHERE agent_photo_2_key = ?').bind(newKey, oldKey).run();
-      await c.env.DB.prepare('UPDATE events SET flyer_key = ? WHERE flyer_key = ?').bind(newKey, oldKey).run();
-      
-    } catch (err: any) {
-      console.error('Rename error:', err);
-      return c.text(`Rename failed: ${err.message}`, 500);
+    const stmts = [
+      c.env.DB.prepare('UPDATE events SET photo_key = ? WHERE photo_key = ?').bind(newKey, oldKey),
+      c.env.DB.prepare('UPDATE events SET agent_photo_key = ? WHERE agent_photo_key = ?').bind(newKey, oldKey),
+      c.env.DB.prepare('UPDATE events SET agent_photo_2_key = ? WHERE agent_photo_2_key = ?').bind(newKey, oldKey),
+      c.env.DB.prepare('UPDATE events SET flyer_key = ? WHERE flyer_key = ?').bind(newKey, oldKey),
+    ];
+    try {
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        stmts,
+        {
+          action: 'admin.storage.rename',
+          targetType: 'storage',
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'storage', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Rename failed');
+    } catch {
+      // The D1 repoint failed after the copy succeeded: newKey is orphaned.
+      // Record a durable delete so it is cleaned up via the media-ops outbox.
+      const orphanGroup = await enqueueMediaOps(c.env.DB, [
+        { action: 'delete', key: newKey, targetType: 'storage', expectedRef: newKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.storage.rename', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId },
+      ]).catch(() => null);
+      if (orphanGroup) {
+        await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, orphanGroup);
+      }
+      return c.text('Rename failed', 500);
     }
   }
   return c.redirect('/admin/storage');
@@ -1684,9 +2624,84 @@ app.get('/admin/storage/list', async (c) => {
     }));
 
     return c.json({ success: true, files });
-  } catch (err: any) {
-    return c.json({ success: false, error: err.message }, 500);
+  } catch {
+    return c.json({ success: false, error: 'Storage listing failed' }, 500);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Admin: media operations reconciliation (R2 + D1 consistency outbox)
+// ---------------------------------------------------------------------------
+
+app.get('/admin/media-ops', async (c) => {
+  if (!requireMediaRole(c)) return c.json({ success: false, error: 'Forbidden' }, 403);
+  const ops = await listMediaOps(c.env.DB);
+
+  const rows = ops
+    .map(
+      (op) => `
+      <tr class="border-t border-gray-200">
+        <td class="px-4 py-2 text-sm font-mono text-gray-900">${escHtml(op.id)}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${escHtml(op.action)}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${escHtml(op.status)}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${op.attempts}</td>
+        <td class="px-4 py-2 text-sm text-gray-900">${escHtml(op.errorCode ?? '')}</td>
+        <td class="px-4 py-2 text-sm text-gray-500">${escHtml(op.createdAt)}</td>
+        <td class="px-4 py-2 text-sm">
+          ${op.status === 'failed' ? `<form action="/admin/media-ops/retry/${encodeURIComponent(op.id)}" method="POST" class="inline"><button type="submit" class="text-indigo-600 underline">Retry</button></form>` : ''}
+        </td>
+      </tr>`
+    )
+    .join('');
+
+  const body = `
+    <div class="max-w-6xl mx-auto p-6">
+      <h1 class="text-xl font-bold text-gray-900 mb-2">Media Operations</h1>
+      <p class="text-sm text-gray-500 mb-4">R2 + D1 consistency outbox. Statuses: pending, completed, failed, or superseded (a newer operation won; never re-applied). A request only reports success once its D1 change, audit row, and R2 operation all complete. A 500 response may leave an operation pending reconciliation — it is not rolled back. Retries are idempotent, refcount-guarded, and serialized per group. Object keys are intentionally not displayed.</p>
+      ${ops.length === 0 ? '<p class="text-gray-500">No pending or failed media operations.</p>' : `
+      <table class="w-full text-left border border-gray-200 rounded-lg overflow-hidden">
+        <thead class="bg-gray-50 text-gray-600 text-xs uppercase">
+          <tr>
+            <th class="px-4 py-2">Op ID</th>
+            <th class="px-4 py-2">Action</th>
+            <th class="px-4 py-2">Status</th>
+            <th class="px-4 py-2">Attempts</th>
+            <th class="px-4 py-2">Error code</th>
+            <th class="px-4 py-2">Created</th>
+            <th class="px-4 py-2"></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`}
+    </div>`;
+
+  return c.html(pageShell('Media Operations', adminNav(`<a href="/admin/media-ops" class="text-indigo-600 text-sm font-medium">Media Ops<\/a>`) + body));
+});
+
+app.post('/admin/media-ops/retry/:opId', async (c) => {
+  if (!requireMediaRole(c)) return c.json({ success: false, error: 'Forbidden' }, 403);
+  const opId = c.req.param('opId');
+  const existing = await getMediaOp(c.env.DB, opId);
+  if (!existing) return c.notFound();
+
+  // Audit the retry action itself (opaque op id only; never a storage key).
+  try {
+    await commitAudited(c, { action: 'admin.media_ops.retry', targetType: 'media_op', targetId: opId }, []);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Retry audit failed');
+  }
+
+  const result = await retryMediaOp({ BUCKET: c.env.BUCKET }, c.env.DB, opId);
+  if (!result.ok) {
+    // A 500 here does NOT mean the durable op was rolled back: the outbox op
+    // may be pending or in progress and is reconciled on the Media Operations
+    // page. Never surface op details or keys.
+    return c.html(
+      pageShell('Error', '<div class="flex items-center justify-center min-h-screen"><p class="text-gray-500">Retry did not complete; the operation may be pending reconciliation. Review the Media Operations page.<\/p><\/div>'),
+      500
+    );
+  }
+  return c.redirect('/admin/media-ops');
 });
 
 function buildTabBar(activeFilter: string, counts: Record<string, number>, view: string): string {
@@ -1738,14 +2753,15 @@ function buildTabBar(activeFilter: string, counts: Record<string, number>, view:
 // Admin: new event form
 // ---------------------------------------------------------------------------
 
-app.get('/admin/events/new', (c) => {
+app.get('/admin/events/new', async (c) => {
+  const listings = await loadInventoryListings(c);
   const body = `
 ${adminNav()}
 <div class="max-w-2xl mx-auto px-4 py-10">
   <h1 class="text-2xl font-bold text-gray-900 mb-6">Create New Event<\/h1>
   <div class="bg-white rounded-2xl shadow p-6">
     <form method="POST" action="/admin/events/new" class="space-y-5">
-      ${eventFormFields()}
+      ${eventFormFields(undefined, listings)}
       <div class="flex justify-end pt-2">
         <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-2.5 rounded-lg transition-colors">
           Create Event
@@ -1765,6 +2781,9 @@ app.post('/admin/events/new', async (c) => {
   const form = await c.req.formData();
 
   const title = (form.get('title') as string | null)?.trim() ?? '';
+  const listingId = (form.get('listing_id') as string | null)?.trim() ?? '';
+  const listing = listingId ? await resolveInventoryListing(c, listingId) : null;
+  const snapshot = listing ? listingSnapshot(listing) : null;
   const property_address = (form.get('property_address') as string | null)?.trim() ?? '';
   const agent_name = (form.get('agent_name') as string | null)?.trim() ?? '';
   const agent_email = (form.get('agent_email') as string | null)?.trim() ?? '';
@@ -1776,20 +2795,21 @@ app.post('/admin/events/new', async (c) => {
   const timezone = (form.get('timezone') as string | null)?.trim() || 'America/New_York';
   const listing_url = (form.get('listing_url') as string | null)?.trim() || null;
 
-  if (!title || !property_address || !agent_name || !agent_email || !start_time || !end_time) {
-    return c.html(
-      pageShell(
-        'Error',
-        `<div class="flex items-center justify-center min-h-screen">
-          <div class="text-center p-8">
-            <h1 class="text-xl font-bold text-red-600 mb-2">Missing required fields<\/h1>
-            <a href="/admin/events/new" class="text-indigo-600 underline">Go back<\/a>
-          <\/div>
-        <\/div>`
-      ),
-      400
-    );
+  if (!title || !start_time || !end_time || !property_address || !agent_name || !agent_email) {
+    return eventCreationError('Complete the title, property address, agent name, agent email, start time, and end time.', 400);
   }
+
+  const session = c.get('session') as Session | undefined;
+  const effectiveAgentUserId = snapshot?.agentUserId
+    || (session?.userEmail && session.userEmail.toLowerCase() === agent_email.toLowerCase() ? session.userId : null);
+  const effectiveSnapshot = snapshot ? {
+    ...snapshot,
+    address: property_address,
+    agentName: agent_name,
+    agentEmail: agent_email,
+    agentPhone: agent_phone,
+    listingUrl: listing_url,
+  } : null;
 
   const id = generateId();
   const admin_token = generateToken(16);
@@ -1801,23 +2821,34 @@ app.post('/admin/events/new', async (c) => {
   const endUtc = toUtc(end_time, timezone);
 
   try {
-    await c.env.DB.prepare(
-      `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO events (id, listing_id, property_id, agent_user_id, professional_license_id,
+        listing_source, listing_source_version, listing_snapshot_synced_at, listing_snapshot_json,
+        title, property_address, agent_name, agent_email, agent_phone, company_name, description,
+        start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token,
+        tenant_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
     )
-      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token, rsvp_token, now, now)
-      .run();
+      .bind(id, snapshot?.listingId || null, snapshot?.propertyId || null, effectiveAgentUserId, snapshot?.professionalLicenseId || null,
+        snapshot?.source || null, snapshot?.sourceVersion || null, snapshot?.syncedAt || null, effectiveSnapshot ? JSON.stringify(effectiveSnapshot) : null,
+        title, property_address, agent_name, agent_email, agent_phone,
+        company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token,
+        rsvp_token, sessionTenant(c), now, now);
+
+    await commitAudited(c, { action: 'admin.event.create', targetType: 'event', targetId: id }, [insertStmt]);
 
     return c.redirect(`/admin/events/${admin_token}`);
-  } catch (err: any) {
-    console.error('Error creating event:', err);
+  } catch {
+    // Never log or render the caught error: it can embed SQL detail or other
+    // sensitive values. Fixed structured code only.
+    console.error(JSON.stringify({ event: 'admin.mutation.error', message: 'Create failed' }));
     return c.html(
       pageShell(
         'Error',
         `<div class="max-w-2xl mx-auto px-4 py-10">
           <div class="bg-white rounded-2xl shadow p-8 text-center">
             <h1 class="text-xl font-bold text-red-600 mb-4">Database Error<\/h1>
-            <p class="text-gray-600 mb-6">${escHtml(err.message || 'Unknown error')}<\/p>
+            <p class="text-gray-600 mb-6">The event could not be created. Please try again.<\/p>
             <a href="/admin/events/new" class="text-indigo-600 underline">Try again<\/a>
           </div>
         </div>`
@@ -1831,18 +2862,57 @@ app.post('/admin/events/new', async (c) => {
 // Admin: event detail page
 // ---------------------------------------------------------------------------
 
+// Uses the same session, tenant, assignment and CSRF gates as event management.
+app.get('/admin/events/:adminToken/crm-delivery', async (c) => {
+  const event = await c.env.DB.prepare('SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?')
+    .bind(c.req.param('adminToken'), sessionTenant(c)).first<Event>();
+  if (!event) return c.notFound();
+  if (!isUserAssignedToEvent(getUserSession(c), event)) return c.text('Forbidden', 403);
+  const guests = await c.env.DB.prepare(`SELECT id, crm_sync_status, crm_attempts, crm_error_code
+    FROM guests WHERE event_id = ? AND consent_contact = 1 ORDER BY signed_in_at DESC`).bind(event.id)
+    .all<{ id: string; crm_sync_status: string; crm_attempts: number; crm_error_code: string | null }>();
+  return c.html(pageShell('CRM delivery', `<main class="max-w-3xl mx-auto p-8"><h1>CRM delivery</h1>
+    <p>Attendance is saved on the server. CRM delivery is a separate acknowledgment.
+    Repair the event agent assignment before retrying rejected attendance.</p>
+    ${guests.results.map(g => `<div class="border p-4 my-3"><p>${escHtml(g.id)} — ${escHtml(g.crm_sync_status)}
+      (${g.crm_attempts} attempts) ${escHtml(g.crm_error_code || '')}</p>
+      ${g.crm_sync_status !== 'synced' ? `<form method="post" action="/admin/events/${escHtml(event.admin_token)}/crm-delivery/${escHtml(g.id)}/retry"><button>Retry delivery</button></form>` : ''}</div>`).join('')}</main>`));
+});
+app.post('/admin/events/:adminToken/crm-delivery/:guestId/retry', async (c) => {
+  const event = await c.env.DB.prepare('SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?')
+    .bind(c.req.param('adminToken'), sessionTenant(c)).first<Event>();
+  if (!event) return c.notFound();
+  if (!isUserAssignedToEvent(getUserSession(c), event)) return c.text('Forbidden', 403);
+  const guestId = c.req.param('guestId');
+  await commitAudited(c, { action: 'admin.attendance.retry', targetType: 'guest', targetId: guestId }, [
+    c.env.DB.prepare(`UPDATE guests SET crm_attempts = 0, crm_sync_status = 'pending', crm_next_attempt_at = NULL,
+      crm_lease = NULL, crm_error_code = NULL WHERE id = ? AND event_id = ? AND crm_sync_status <> 'synced'
+      AND (crm_lease IS NULL OR crm_next_attempt_at <= ?)`)
+      .bind(guestId, event.id, new Date().toISOString()),
+  ]);
+  return c.redirect(`/admin/events/${event.admin_token}/crm-delivery`);
+});
+
 app.get('/admin/events/:adminToken', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE admin_token = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Event>();
 
   if (!event) {
     return c.html(
       pageShell('Not Found', '<div class="flex items-center justify-center min-h-screen"><p class="text-gray-500">Event not found.<\/p><\/div>'),
       404
+    );
+  }
+
+  const userSession = getUserSession(c);
+  if (!isUserAssignedToEvent(userSession, event)) {
+    return c.html(
+      pageShell('Forbidden', '<div class="max-w-xl mx-auto py-20 px-4 text-center"><a class="text-indigo-600 underline" href="/admin/events/${escHtml(event.admin_token)}/crm-delivery">CRM delivery and repair</a><h1 class="text-2xl font-bold text-red-600 mb-2">Access Restricted<\/h1><p class="text-gray-600 mb-6">You are not assigned to manage this open house event. Only the assigned agent or a broker/admin can manage event details.<\/p><a href="/admin" class="inline-block bg-indigo-600 text-white font-medium px-4 py-2 rounded-lg hover:bg-indigo-700">Back to Events<\/a><\/div>'),
+      403
     );
   }
 
@@ -2190,7 +3260,7 @@ ${followUpModal}
       <div class="bg-white rounded-xl shadow p-6">
         <h2 class="font-semibold text-gray-900 mb-4">Event Details<\/h2>
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/update" class="space-y-4">
-          ${eventFormFields(event)}
+          ${eventFormFields(event, await loadInventoryListings(c))}
           <div class="flex justify-end pt-1">
             <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-5 py-2 rounded-lg transition-colors text-sm">Save Changes<\/button>
           <\/div>
@@ -2423,44 +3493,86 @@ function toggleAgent2(checked) {
 app.post('/admin/events/:adminToken/update', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
-    .first<Pick<Event, 'id'>>();
+    .bind(adminToken, sessionTenant(c))
+    .first<Event>();
 
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
   const now = new Date().toISOString();
+  const listingId = (form.get('listing_id') as string | null)?.trim() || '';
+  const listing = listingId ? await resolveInventoryListing(c, listingId) : null;
+  const snapshot = listing ? listingSnapshot(listing) : null;
+  const title = (form.get('title') as string | null)?.trim() || '';
+  const propertyAddress = (form.get('property_address') as string | null)?.trim() || '';
+  const agentName = (form.get('agent_name') as string | null)?.trim() || '';
+  const agentEmail = (form.get('agent_email') as string | null)?.trim() || '';
+  const agentPhone = (form.get('agent_phone') as string | null)?.trim() || null;
+  const listingUrl = (form.get('listing_url') as string | null)?.trim() || null;
+  if (!title || !propertyAddress || !agentName || !agentEmail) {
+    return c.json({ error: 'Title, property address, agent name, and agent email are required.' }, 400);
+  }
+
+  const session = c.get('session') as Session | undefined;
+  const retainingExistingLink = Boolean(listingId && listingId === event.listing_id && !snapshot);
+  const effectiveAgentUserId = snapshot?.agentUserId
+    || (session?.userEmail && session.userEmail.toLowerCase() === agentEmail.toLowerCase() ? session.userId : null)
+    || (retainingExistingLink ? event.agent_user_id : null);
+  const effectiveSnapshot = snapshot ? {
+    ...snapshot,
+    address: propertyAddress,
+    agentName,
+    agentEmail,
+    agentPhone,
+    listingUrl,
+  } : null;
 
   const startTimeUtc = toUtc((form.get('start_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
   const endTimeUtc = toUtc((form.get('end_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
 
-  await c.env.DB.prepare(
-    `UPDATE events SET
-      title = ?, property_address = ?, agent_name = ?, agent_email = ?, agent_phone = ?,
-      company_name = ?, description = ?, start_time = ?, end_time = ?, timezone = ?,
-      listing_url = ?, updated_at = ?
-     WHERE admin_token = ?`
-  )
-    .bind(
-      (form.get('title') as string)?.trim(),
-      (form.get('property_address') as string)?.trim(),
-      (form.get('agent_name') as string)?.trim(),
-      (form.get('agent_email') as string)?.trim(),
-      (form.get('agent_phone') as string | null)?.trim() || null,
-      (form.get('company_name') as string | null)?.trim() || null,
-      (form.get('description') as string | null)?.trim() || null,
-      startTimeUtc,
-      endTimeUtc,
-      (form.get('timezone') as string)?.trim() || 'America/New_York',
-      (form.get('listing_url') as string | null)?.trim() || null,
-      now,
-      adminToken
+  try {
+    const updateStmt = c.env.DB.prepare(
+      `UPDATE events SET
+        listing_id = ?, property_id = ?, agent_user_id = ?, professional_license_id = ?,
+        listing_source = ?, listing_source_version = ?, listing_snapshot_synced_at = ?, listing_snapshot_json = ?,
+        title = ?, property_address = ?, agent_name = ?, agent_email = ?, agent_phone = ?,
+        company_name = ?, description = ?, start_time = ?, end_time = ?, timezone = ?,
+        listing_url = ?, updated_at = ?
+       WHERE admin_token = ? AND tenant_id = ?`
     )
-    .run();
+      .bind(
+        snapshot?.listingId ?? (retainingExistingLink ? event.listing_id : null),
+        snapshot?.propertyId ?? (retainingExistingLink ? event.property_id : null),
+        effectiveAgentUserId,
+        snapshot?.professionalLicenseId ?? (retainingExistingLink ? event.professional_license_id : null),
+        snapshot?.source ?? (retainingExistingLink ? event.listing_source : null),
+        snapshot?.sourceVersion ?? (retainingExistingLink ? event.listing_source_version : null),
+        snapshot?.syncedAt ?? (retainingExistingLink ? event.listing_snapshot_synced_at : null),
+        effectiveSnapshot ? JSON.stringify(effectiveSnapshot) : (retainingExistingLink ? event.listing_snapshot_json : null),
+        title,
+        propertyAddress,
+        agentName,
+        agentEmail,
+        agentPhone,
+        (form.get('company_name') as string | null)?.trim() || null,
+        (form.get('description') as string | null)?.trim() || null,
+        startTimeUtc,
+        endTimeUtc,
+        (form.get('timezone') as string)?.trim() || 'America/New_York',
+        listingUrl,
+        now,
+        adminToken,
+        sessionTenant(c)
+      );
 
-  return c.redirect(`/admin/events/${adminToken}`);
+    await commitAudited(c, { action: 'admin.event.update', targetType: 'event', targetId: event.id }, [updateStmt]);
+
+    return c.redirect(`/admin/events/${adminToken}`);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Update failed');
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -2470,25 +3582,54 @@ app.post('/admin/events/:adminToken/update', async (c) => {
 app.post('/admin/events/:adminToken/photo', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'photo_key'>>();
 
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
-    if (event.photo_key && event.photo_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.photo_key);
-    }
-    await c.env.DB.prepare(
+    const oldKey = event.photo_key && event.photo_key !== existingKey ? event.photo_key : null;
+    const stmt = c.env.DB.prepare(
       'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
     )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.photo', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Photo update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
+    }
+    const actor = actorContext(c);
+    try {
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.photo',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Photo update failed');
+    } catch (err) {
+      return auditedMutationError(c, err, 'Photo update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -2498,24 +3639,9 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  if (event.photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.photo_key);
-  }
-
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `events/${event.id}/${generateId()}.${ext}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: file.type || 'image/jpeg' },
-  });
-
-  await c.env.DB.prepare(
-    'UPDATE events SET photo_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'photo_key', 'admin.event.photo', file.type || 'image/jpeg', event.photo_key || null, event.photo_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -2525,24 +3651,15 @@ app.post('/admin/events/:adminToken/photo', async (c) => {
 app.post('/admin/events/:adminToken/photo/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'photo_key'>>();
 
   if (!event) return c.notFound();
 
-  if (event.photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.photo_key);
-  }
-
-  await c.env.DB.prepare(
-    'UPDATE events SET photo_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'photo_key', 'admin.event.photo_delete', [event.photo_key], event.photo_key ?? null, idemKey);
 });
 
 // ---------------------------------------------------------------------------
@@ -2552,25 +3669,54 @@ app.post('/admin/events/:adminToken/photo/delete', async (c) => {
 app.post('/admin/events/:adminToken/agent-photo', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_key'>>();
 
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
-    if (event.agent_photo_key && event.agent_photo_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
-    }
-    await c.env.DB.prepare(
+    const oldKey = event.agent_photo_key && event.agent_photo_key !== existingKey ? event.agent_photo_key : null;
+    const stmt = c.env.DB.prepare(
       'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
     )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.agent_photo', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Agent photo update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
+    }
+    const actor = actorContext(c);
+    try {
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.agent_photo',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Agent photo update failed');
+    } catch (err) {
+      return auditedMutationError(c, err, 'Agent photo update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -2580,24 +3726,9 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  if (event.agent_photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
-  }
-
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `agents/${event.id}/${generateId()}.${ext}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: file.type || 'image/jpeg' },
-  });
-
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'agent_photo_key', 'admin.event.agent_photo', file.type || 'image/jpeg', event.agent_photo_key || null, event.agent_photo_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -2607,25 +3738,54 @@ app.post('/admin/events/:adminToken/agent-photo', async (c) => {
 app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_2_key'>>();
 
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
-    if (event.agent_photo_2_key && event.agent_photo_2_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
-    }
-    await c.env.DB.prepare(
+    const oldKey = event.agent_photo_2_key && event.agent_photo_2_key !== existingKey ? event.agent_photo_2_key : null;
+    const stmt = c.env.DB.prepare(
       'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
     )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.agent_photo_2', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Agent photo 2 update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
+    }
+    const actor = actorContext(c);
+    try {
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.agent_photo_2',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.agent_photo_2', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Agent photo 2 update failed');
+    } catch (err) {
+      return auditedMutationError(c, err, 'Agent photo 2 update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -2635,24 +3795,9 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  if (event.agent_photo_2_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
-  }
-
   const ext = file.name.split('.').pop() ?? 'jpg';
   const key = `agents/${event.id}/${generateId()}_2.${ext}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: file.type || 'image/jpeg' },
-  });
-
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_2_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2', file.type || 'image/jpeg', event.agent_photo_2_key || null, event.agent_photo_2_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -2662,47 +3807,29 @@ app.post('/admin/events/:adminToken/agent-photo-2', async (c) => {
 app.post('/admin/events/:adminToken/agent-photo/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_key'>>();
 
   if (!event) return c.notFound();
 
-  if (event.agent_photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
-  }
-
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'agent_photo_key', 'admin.event.agent_photo_delete', [event.agent_photo_key], event.agent_photo_key ?? null, idemKey);
 });
 
 app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ?'
+    'SELECT id, agent_photo_2_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'agent_photo_2_key'>>();
 
   if (!event) return c.notFound();
 
-  if (event.agent_photo_2_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
-  }
-
-  await c.env.DB.prepare(
-    'UPDATE events SET agent_photo_2_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'agent_photo_2_key', 'admin.event.agent_photo_2_delete', [event.agent_photo_2_key], event.agent_photo_2_key ?? null, idemKey);
 });
 
 // ---------------------------------------------------------------------------
@@ -2712,25 +3839,54 @@ app.post('/admin/events/:adminToken/agent-photo-2/delete', async (c) => {
 app.post('/admin/events/:adminToken/flyer', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, flyer_key FROM events WHERE admin_token = ?'
+    'SELECT id, flyer_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
   const existingKey = form.get('existing_key') as string | null;
+  const idemKey = await idempotencyKeyOf(c, form);
 
   if (existingKey) {
-    if (event.flyer_key && event.flyer_key !== existingKey) {
-      await deleteR2FileIfUnreferenced(c, event.flyer_key);
-    }
-    await c.env.DB.prepare(
+    const oldKey = event.flyer_key && event.flyer_key !== existingKey ? event.flyer_key : null;
+    const stmt = c.env.DB.prepare(
       'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
     )
-      .bind(existingKey, new Date().toISOString(), adminToken)
-      .run();
+      .bind(existingKey, new Date().toISOString(), adminToken);
+    if (!oldKey) {
+      try {
+        await commitAudited(c, { action: 'admin.event.flyer', targetType: 'event', targetId: event.id }, [stmt]);
+      } catch (err) {
+        return auditedMutationError(c, err, 'Flyer update failed');
+      }
+      return c.redirect(`/admin/events/${adminToken}`);
+    }
+    const actor = actorContext(c);
+    try {
+      const groupId = await enqueueMediaOpsAtomic(
+        c.env.DB,
+        [stmt],
+        {
+          action: 'admin.event.flyer',
+          targetType: 'event',
+          targetId: event.id,
+          actorId: actor.actorId ?? undefined,
+          actorEmail: actor.actorEmail ?? undefined,
+          tenantId: actor.tenantId ?? undefined,
+          outcome: 'success',
+          requestId: actor.requestId,
+        },
+        [{ action: 'delete', key: oldKey, targetType: 'event', expectedRef: oldKey, intendedRef: null, tenantId: actor.tenantId, auditAction: 'admin.event.flyer', actorId: actor.actorId, actorEmail: actor.actorEmail, requestId: actor.requestId }],
+        idemKey ?? undefined
+      );
+      const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+      if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Flyer update failed');
+    } catch (err) {
+      return auditedMutationError(c, err, 'Flyer update failed');
+    }
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
@@ -2758,23 +3914,8 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
     );
   }
 
-  if (event.flyer_key) {
-    await deleteR2FileIfUnreferenced(c, event.flyer_key);
-  }
-
   const key = `flyers/${event.id}/${generateId()}.${rawExt}`;
-
-  await c.env.BUCKET.put(key, file.stream(), {
-    httpMetadata: { contentType: safeContentType },
-  });
-
-  await c.env.DB.prepare(
-    'UPDATE events SET flyer_key = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(key, new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  return await uploadMedia(c, file, key, event.id, 'flyer_key', 'admin.event.flyer', safeContentType, event.flyer_key || null, event.flyer_key ?? null, idemKey, `/admin/events/${adminToken}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -2784,24 +3925,15 @@ app.post('/admin/events/:adminToken/flyer', async (c) => {
 app.post('/admin/events/:adminToken/flyer/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, flyer_key FROM events WHERE admin_token = ?'
+    'SELECT id, flyer_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
 
-  if (event.flyer_key) {
-    await deleteR2FileIfUnreferenced(c, event.flyer_key);
-  }
-
-  await c.env.DB.prepare(
-    'UPDATE events SET flyer_key = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
-
-  return c.redirect(`/admin/events/${adminToken}`);
+  const idemKey = await idempotencyKeyOf(c);
+  return await deleteEventMedia(c, adminToken, event.id, 'flyer_key', 'admin.event.flyer_delete', [event.flyer_key], event.flyer_key ?? null, idemKey);
 });
 
 // ---------------------------------------------------------------------------
@@ -2830,9 +3962,9 @@ app.post('/admin/events/:adminToken/guests/:guestId/followup', async (c) => {
   const guestId = c.req.param('guestId');
 
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
@@ -2841,11 +3973,15 @@ app.post('/admin/events/:adminToken/guests/:guestId/followup', async (c) => {
   const follow_up_status = (form.get('follow_up_status') as string | null)?.trim() ?? 'pending';
   const follow_up_notes = (form.get('follow_up_notes') as string | null)?.trim() || null;
 
-  await c.env.DB.prepare(
-    'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
-  )
-    .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
+    )
+      .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id);
+    await commitAudited(c, { action: 'admin.guest.followup', targetType: 'guest', targetId: guestId }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Follow-up update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -2863,11 +3999,23 @@ app.post('/admin/events/:adminToken/status', async (c) => {
     return c.redirect(`/admin/events/${adminToken}`);
   }
 
-  await c.env.DB.prepare(
-    'UPDATE events SET status = ?, updated_at = ? WHERE admin_token = ?'
+  const event = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(newStatus, new Date().toISOString(), adminToken)
-    .run();
+    .bind(adminToken, sessionTenant(c))
+    .first<Pick<Event, 'id'>>();
+
+  if (!event) return c.notFound();
+
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET status = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(newStatus, new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.status', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Status update failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -2879,18 +4027,22 @@ app.post('/admin/events/:adminToken/status', async (c) => {
 app.post('/admin/events/:adminToken/delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
 
-  await c.env.DB.prepare(
-    'UPDATE events SET deleted_at = ?, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET deleted_at = ?, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.delete', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Delete failed');
+  }
 
   return c.redirect('/admin?filter=deleted');
 });
@@ -2902,18 +4054,22 @@ app.post('/admin/events/:adminToken/delete', async (c) => {
 app.post('/admin/events/:adminToken/restore', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
 
-  await c.env.DB.prepare(
-    'UPDATE events SET deleted_at = NULL, updated_at = ? WHERE admin_token = ?'
-  )
-    .bind(new Date().toISOString(), adminToken)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE events SET deleted_at = NULL, updated_at = ? WHERE admin_token = ?'
+    )
+      .bind(new Date().toISOString(), adminToken);
+    await commitAudited(c, { action: 'admin.event.restore', targetType: 'event', targetId: event.id }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Restore failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -2925,27 +4081,58 @@ app.post('/admin/events/:adminToken/restore', async (c) => {
 app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events WHERE admin_token = ?'
+    'SELECT id, photo_key, agent_photo_key, agent_photo_2_key, flyer_key FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'photo_key' | 'agent_photo_key' | 'agent_photo_2_key' | 'flyer_key'>>();
 
   if (!event) return c.notFound();
 
-  if (event.photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.photo_key);
-  }
-  if (event.agent_photo_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_key);
-  }
-  if (event.agent_photo_2_key) {
-    await deleteR2FileIfUnreferenced(c, event.agent_photo_2_key);
-  }
-  if (event.flyer_key) {
-    await deleteR2FileIfUnreferenced(c, event.flyer_key);
-  }
+  const idemKey = await idempotencyKeyOf(c);
 
-  await c.env.DB.prepare('DELETE FROM events WHERE id = ?').bind(event.id).run();
+  const actor = actorContext(c);
+  const mediaKeys = [event.photo_key, event.agent_photo_key, event.agent_photo_2_key, event.flyer_key].filter(
+    (k): k is string => Boolean(k)
+  );
+  const stmt = c.env.DB.prepare('DELETE FROM events WHERE id = ? AND tenant_id = ?').bind(event.id, sessionTenant(c));
+
+  try {
+    if (mediaKeys.length === 0) {
+      await commitAudited(c, { action: 'admin.event.permanent_delete', targetType: 'event', targetId: event.id }, [stmt]);
+      return c.redirect('/admin?filter=deleted');
+    }
+    const groupId = await enqueueMediaOpsAtomic(
+      c.env.DB,
+      [stmt],
+      {
+        action: 'admin.event.permanent_delete',
+        targetType: 'event',
+        targetId: event.id,
+        actorId: actor.actorId ?? undefined,
+        actorEmail: actor.actorEmail ?? undefined,
+        tenantId: actor.tenantId ?? undefined,
+        outcome: 'success',
+        requestId: actor.requestId,
+      },
+      mediaKeys.map((key) => ({
+        action: 'delete' as const,
+        key,
+        targetType: 'event',
+        expectedRef: key,
+        intendedRef: null,
+        tenantId: actor.tenantId,
+        auditAction: 'admin.event.permanent_delete',
+        actorId: actor.actorId,
+        actorEmail: actor.actorEmail,
+        requestId: actor.requestId,
+      })),
+      idemKey ?? undefined
+    );
+    const ok = await executeMediaGroup({ BUCKET: c.env.BUCKET }, c.env.DB, groupId);
+    if (!ok) return auditedMutationError(c, new Error('media operation incomplete'), 'Permanent delete failed');
+  } catch (err) {
+    return auditedMutationError(c, err, 'Permanent delete failed');
+  }
 
   return c.redirect('/admin?filter=deleted');
 });
@@ -2957,9 +4144,9 @@ app.post('/admin/events/:adminToken/permanent-delete', async (c) => {
 app.post('/admin/events/:adminToken/duplicate', async (c) => {
   const adminToken = c.req.param('adminToken');
   const source = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE admin_token = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Event>();
 
   if (!source) return c.notFound();
@@ -2970,37 +4157,53 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
   const newRsvpToken = generateToken(16);
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name,
-       description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key, agent_photo_2_key, flyer_key,
-       status, admin_token, public_token, rsvp_token, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      newId,
-      // Strip existing "(Copy)" suffix to avoid "Event (Copy) (Copy) (Copy)..." stacking
-      `${source.title.replace(/\s*\(Copy\)\s*$/, '').trim()} (Copy)`,
-      source.property_address,
-      source.agent_name,
-      source.agent_email,
-      source.agent_phone,
-      source.company_name,
-      source.description,
-      source.start_time,
-      source.end_time,
-      source.timezone,
-      source.listing_url,
-      source.photo_key,
-      source.agent_photo_key,
-      source.agent_photo_2_key,
-      source.flyer_key,
-      newAdminToken,
-      newPublicToken,
-      newRsvpToken,
-      now,
-      now
+  try {
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO events (id, listing_id, property_id, agent_user_id, professional_license_id,
+         listing_source, listing_source_version, listing_snapshot_synced_at, listing_snapshot_json,
+         title, property_address, agent_name, agent_email, agent_phone, company_name,
+         description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key, agent_photo_2_key, flyer_key,
+         status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
     )
-    .run();
+      .bind(
+        newId,
+        source.listing_id,
+        source.property_id,
+        source.agent_user_id,
+        source.professional_license_id,
+        source.listing_source,
+        source.listing_source_version,
+        source.listing_snapshot_synced_at,
+        source.listing_snapshot_json,
+        // Strip existing "(Copy)" suffix to avoid "Event (Copy) (Copy) (Copy)..." stacking
+        `${source.title.replace(/\s*\(Copy\)\s*$/, '').trim()} (Copy)`,
+        source.property_address,
+        source.agent_name,
+        source.agent_email,
+        source.agent_phone,
+        source.company_name,
+        source.description,
+        source.start_time,
+        source.end_time,
+        source.timezone,
+        source.listing_url,
+        source.photo_key,
+        source.agent_photo_key,
+        source.agent_photo_2_key,
+        source.flyer_key,
+        newAdminToken,
+        newPublicToken,
+        newRsvpToken,
+        sessionTenant(c),
+        now,
+        now
+      );
+
+    await commitAudited(c, { action: 'admin.event.duplicate', targetType: 'event', targetId: newId }, [insertStmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Duplicate failed');
+  }
 
   return c.redirect(`/admin/events/${newAdminToken}`);
 });
@@ -3012,9 +4215,9 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
 app.get('/admin/events/:adminToken/qr', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT public_token FROM events WHERE admin_token = ?'
+    'SELECT public_token FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'public_token'>>();
 
   if (!event) return c.notFound();
@@ -3360,11 +4563,15 @@ app.post('/agent/:adminToken/guests/:guestId/followup', async (c) => {
   const follow_up_status = (form.get('follow_up_status') as string | null)?.trim() ?? 'pending';
   const follow_up_notes = (form.get('follow_up_notes') as string | null)?.trim() || null;
 
-  await c.env.DB.prepare(
-    'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
-  )
-    .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE guests SET follow_up_status = ?, follow_up_notes = ?, follow_up_at = ? WHERE id = ? AND event_id = ?'
+    )
+      .bind(follow_up_status, follow_up_notes, new Date().toISOString(), guestId, event.id);
+    await commitAudited(c, { action: 'admin.guest.followup', targetType: 'guest', targetId: guestId }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Follow-up update failed');
+  }
 
   return c.redirect(`/agent/${adminToken}`);
 });
@@ -3385,11 +4592,15 @@ app.post('/agent/:adminToken/guests/:guestId/checkin', async (c) => {
 
   if (!event) return c.notFound();
 
-  await c.env.DB.prepare(
-    'UPDATE guests SET checked_in = 1, checked_in_at = ? WHERE id = ? AND event_id = ?'
-  )
-    .bind(new Date().toISOString(), guestId, event.id)
-    .run();
+  try {
+    const stmt = c.env.DB.prepare(
+      'UPDATE guests SET checked_in = 1, checked_in_at = ? WHERE id = ? AND event_id = ?'
+    )
+      .bind(new Date().toISOString(), guestId, event.id);
+    await commitAudited(c, { action: 'admin.guest.checkin', targetType: 'guest', targetId: guestId }, [stmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Check-in failed');
+  }
 
   return c.redirect(`/agent/${adminToken}`);
 });
@@ -3422,12 +4633,17 @@ app.post('/agent/:adminToken/guests/add', async (c) => {
   const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
-  )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now)
-    .run();
+  const guestId = generateId();
+  try {
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    )
+      .bind(guestId, event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now);
+    await commitAudited(c, { action: 'admin.guest.add', targetType: 'guest', targetId: guestId }, [insertStmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Add guest failed');
+  }
 
   return c.redirect(`/agent/${adminToken}`);
 });
@@ -3472,9 +4688,9 @@ app.post('/admin/events/:adminToken/guests/add', async (c) => {
   const adminToken = c.req.param('adminToken');
 
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ?'
+    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id'>>();
 
   if (!event) return c.notFound();
@@ -3492,12 +4708,17 @@ app.post('/admin/events/:adminToken/guests/add', async (c) => {
   const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
-  )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now)
-    .run();
+  const guestId = generateId();
+  try {
+    const insertStmt = c.env.DB.prepare(
+      `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, is_agent, notes, signed_in_at, follow_up_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    )
+      .bind(guestId, event.id, firstName, lastName, email, phone, isRsvp, isAgent, notes, now);
+    await commitAudited(c, { action: 'admin.guest.add', targetType: 'guest', targetId: guestId }, [insertStmt]);
+  } catch (err) {
+    return auditedMutationError(c, err, 'Add guest failed');
+  }
 
   return c.redirect(`/admin/events/${adminToken}`);
 });
@@ -3510,9 +4731,9 @@ app.get('/admin/events/:adminToken/export.csv', async (c) => {
   const adminToken = c.req.param('adminToken');
 
   const event = await c.env.DB.prepare(
-    'SELECT id, title, timezone FROM events WHERE admin_token = ?'
+    'SELECT id, title, timezone FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Pick<Event, 'id' | 'title' | 'timezone'>>();
 
   if (!event) return c.notFound();
@@ -3630,7 +4851,7 @@ app.get('/rsvp/:rsvpToken', async (c) => {
           <p class="text-gray-500 text-sm mt-1">Reserve your spot &mdash; we&rsquo;d love to see you there</p>
           <div class="divider mt-4"></div>
         </div>
-        <form method="POST" action="/rsvp/${escHtml(rsvpToken)}/submit" class="space-y-4">
+        <form method="POST" action="/rsvp/${escHtml(rsvpToken)}/submit" class="space-y-4" onsubmit="var b=document.getElementById('rsvp-submit-btn');if(b){b.disabled=true;b.innerText='Submitting...';b.classList.add('opacity-75');}">
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">First Name <span class="text-red-400">*</span></label>
@@ -3663,8 +4884,18 @@ app.get('/rsvp/:rsvpToken', async (c) => {
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
               placeholder="Anything you'd like to ask?"></textarea>
           </div>
+          <div class="space-y-2 rounded-xl bg-gray-50 p-3 text-xs text-gray-600">
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_contact" value="1" required class="mt-0.5" style="accent-color:var(--gold)" />
+              <span>I agree that the event&rsquo;s real estate professional may contact me about this property and my RSVP. <span class="text-red-400">*</span></span>
+            </label>
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_marketing" value="1" class="mt-0.5" style="accent-color:var(--gold)" />
+              <span>I would also like occasional real estate updates and marketing messages. Optional.</span>
+            </label>
+          </div>
           <div class="pt-1">
-            <button type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
+            <button id="rsvp-submit-btn" type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
               Confirm My RSVP
             </button>
           </div>
@@ -3728,14 +4959,72 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
 
   const email = (form.get('email') as string | null)?.trim() || null;
   const notes = (form.get('notes') as string | null)?.trim() || null;
+  const consentContact = form.get('consent_contact') === '1' ? 1 : 0;
+  const consentMarketing = form.get('consent_marketing') === '1' ? 1 : 0;
+  if (!consentContact) return c.redirect(`/rsvp/${rsvpToken}`);
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending')`
+  // Normalize for deduplication: digits-only phone, lowercase email.
+  const normPhone = normalizePhone(phone);
+  const normEmail = normalizeEmail(email);
+
+  // Look for an existing RSVP for this event by email (preferred) or phone.
+  const existing = await c.env.DB.prepare(
+    `SELECT id FROM guests
+     WHERE event_id = ? AND is_rsvp = 1
+       AND (
+         (email IS NOT NULL AND trim(email) != '' AND lower(trim(email)) = ?)
+         OR
+         (? != '' AND phone IS NOT NULL AND replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+','') = ?)
+       )
+     ORDER BY signed_in_at DESC LIMIT 1`
   )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, notes, now)
+    .bind(event.id, normEmail, normPhone, normPhone)
+    .first<{ id: string }>();
+
+  if (existing) {
+    // UPDATE the existing RSVP record with the latest information.
+    await c.env.DB.prepare(
+      `UPDATE guests
+       SET first_name = ?, last_name = ?, phone = ?,
+           email = CASE WHEN ? != '' THEN ? ELSE email END,
+           notes = CASE WHEN ? IS NOT NULL THEN ? ELSE notes END,
+           consent_contact = ?, consent_marketing = ?,
+           consent_captured_at = ?
+       WHERE id = ?`
+    )
+      .bind(
+        firstName, lastName, phone,
+        normEmail, email,
+        notes, notes,
+        consentContact, consentMarketing, now,
+        existing.id
+      )
+      .run();
+
+    await syncGuestToCrm(c, event, {
+      id: existing.id, firstName, lastName, email, phone, address: null, notes,
+      consentMarketing, consentCapturedAt: now, occurredAt: now,
+    });
+
+    return c.redirect(`/rsvp/${rsvpToken}/success?updated=1`);
+  }
+
+  // INSERT a new RSVP record.
+  const guestId = generateId();
+  await c.env.DB.prepare(
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes,
+       signed_in_at, follow_up_status, consent_contact, consent_marketing, consent_captured_at, crm_sync_status)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', ?, ?, ?, 'pending')`
+  )
+    .bind(guestId, event.id, firstName, lastName, email, phone, notes, now,
+      consentContact, consentMarketing, now)
     .run();
+
+  await syncGuestToCrm(c, event, {
+    id: guestId, firstName, lastName, email, phone, address: null, notes,
+    consentMarketing, consentCapturedAt: now, occurredAt: now,
+  });
 
   return c.redirect(`/rsvp/${rsvpToken}/success`);
 });
@@ -3746,6 +5035,7 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
 
 app.get('/rsvp/:rsvpToken/success', async (c) => {
   const rsvpToken = c.req.param('rsvpToken');
+  const isUpdated = c.req.query('updated') === '1';
   const event = await c.env.DB.prepare(
     'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key, start_time, end_time, timezone, property_address, flyer_key FROM events WHERE rsvp_token = ?'
   )
@@ -3769,6 +5059,15 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
     .slice(0, 2)
     .toUpperCase() || '??';
 
+  const successHero = isUpdated
+    ? `<div class="text-6xl mb-4">🔄</div>
+       <h1 class="text-2xl font-bold text-gray-900 mb-2">RSVP Updated! 🎉</h1>
+       <p class="text-gray-600 mb-1">You're already registered for <strong>${escHtml(title)}</strong>.</p>
+       <p class="text-gray-500 text-sm mb-4">We've updated your contact information with the latest details — see you there!</p>`
+    : `<div class="text-6xl mb-4">✅</div>
+       <h1 class="text-2xl font-bold text-gray-900 mb-2">You're On The List!</h1>
+       <p class="text-gray-600 mb-3">You've successfully RSVP'd for <strong>${escHtml(title)}</strong>.</p>`;
+
   const body = `
 <div style="background-color:var(--navy);min-height:100vh">
   ${photoUrl
@@ -3779,9 +5078,7 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
     : `<div class="h-20" style="background:linear-gradient(135deg,#1a3557 0%,#0f1c2e 100%)"></div>`}
   <div class="max-w-lg mx-auto px-4 pb-12 -mt-6 relative">
     <div class="glass-card rounded-2xl shadow-2xl p-8 text-center anim-1">
-      <div class="text-6xl mb-4">✅</div>
-      <h1 class="text-2xl font-bold text-gray-900 mb-2">You're On The List!</h1>
-      <p class="text-gray-600 mb-3">You've successfully RSVP'd for <strong>${escHtml(title)}</strong>.</p>
+      ${successHero}
       ${event ? `<p class="text-gray-500 text-sm mb-4 flex items-center justify-center gap-1.5">${icon('clock', 'w-4 h-4')} ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}</p>` : ''}
       
       <div class="flex justify-center mb-6">
@@ -3836,9 +5133,9 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
 app.get('/admin/events/:adminToken/signin-sheet', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT * FROM events WHERE admin_token = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
-    .bind(adminToken)
+    .bind(adminToken, sessionTenant(c))
     .first<Event>();
 
   if (!event) return c.notFound();
@@ -4036,7 +5333,7 @@ function buildGuestsCsv(guests: Guest[], timezone: string): string {
 // Shared: event form fields helper
 // ---------------------------------------------------------------------------
 
-function eventFormFields(ev?: Event): string {
+function eventFormFields(ev?: Event, listings: InventoryListing[] = []): string {
   const timezones = [
     'America/New_York',
     'America/Chicago',
@@ -4077,8 +5374,33 @@ function eventFormFields(ev?: Event): string {
     return fromUtc(iso, timezone);
   };
 
+  const listingOptions = listings.map((listing) => {
+    const snapshot = listingSnapshot(listing);
+    const selected = ev?.listing_id === listing.id;
+    const needsDetails = !snapshot.address || !snapshot.agentName || !snapshot.agentEmail;
+    const status = String(listing.data?.listingStatus || listing.status || '').trim();
+    const label = `${snapshot.address || listing.name}${status ? ` — ${status}` : ''}${needsDetails ? ' — details needed' : ''}`;
+    return `<option value="${escAttr(listing.id)}"${selected ? ' selected' : ''}
+      data-address="${escAttr(snapshot.address)}"
+      data-agent-name="${escAttr(snapshot.agentName)}"
+      data-agent-email="${escAttr(snapshot.agentEmail)}"
+      data-agent-phone="${escAttr(snapshot.agentPhone || '')}"
+      data-listing-url="${escAttr(snapshot.listingUrl || '')}">${escHtml(label)}<\/option>`;
+  }).join('');
+  const legacyOption = ev && !ev.listing_id
+    ? `<option value="" selected>Manual event — not linked to Inventory<\/option>`
+    : `<option value="">Manual event / listing not in Inventory<\/option>`;
+
   return `
   <div class="grid grid-cols-1 gap-4">
+    <div>
+      <label class="block text-sm font-medium text-gray-700 mb-1">Inventory Listing <span class="font-normal text-gray-500">(optional)<\/span><\/label>
+      <select id="inventory-listing-select" name="listing_id"
+        class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        ${legacyOption}${listingOptions}
+      <\/select>
+      <p class="mt-1 text-xs text-gray-500">Selecting a listing prefills the event. You can edit the copied details, or leave this unselected for a manual event.<\/p>
+    <\/div>
     <div>
       <label class="block text-sm font-medium text-gray-700 mb-1">Event Title <span class="text-red-500">*<\/span><\/label>
       <input type="text" name="title" required value="${escAttr(ev?.title ?? '')}"
@@ -4086,25 +5408,25 @@ function eventFormFields(ev?: Event): string {
     <\/div>
     <div>
       <label class="block text-sm font-medium text-gray-700 mb-1">Property Address <span class="text-red-500">*<\/span><\/label>
-      <input type="text" name="property_address" required value="${escAttr(ev?.property_address ?? '')}"
+      <input id="inventory-property-address" type="text" name="property_address" required value="${escAttr(ev?.property_address ?? '')}"
         class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
     <\/div>
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Agent Name <span class="text-red-500">*<\/span><\/label>
-        <input type="text" name="agent_name" required value="${escAttr(ev?.agent_name ?? '')}"
+        <input id="inventory-agent-name" type="text" name="agent_name" required value="${escAttr(ev?.agent_name ?? '')}"
           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
       <\/div>
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Agent Email <span class="text-red-500">*<\/span><\/label>
-        <input type="email" name="agent_email" required value="${escAttr(ev?.agent_email ?? '')}"
+        <input id="inventory-agent-email" type="email" name="agent_email" required value="${escAttr(ev?.agent_email ?? '')}"
           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
       <\/div>
     <\/div>
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Agent Phone<\/label>
-        <input type="tel" name="agent_phone" value="${escAttr(ev?.agent_phone ?? '')}"
+        <input id="inventory-agent-phone" type="tel" name="agent_phone" value="${escAttr(ev?.agent_phone ?? '')}"
           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
       <\/div>
       <div>
@@ -4134,7 +5456,7 @@ function eventFormFields(ev?: Event): string {
     <\/div>
     <div>
       <label class="block text-sm font-medium text-gray-700 mb-1">Listing URL<\/label>
-      <input type="url" name="listing_url" value="${escAttr(ev?.listing_url ?? '')}"
+      <input id="inventory-listing-url" type="url" name="listing_url" value="${escAttr(ev?.listing_url ?? '')}"
         placeholder="https:\/\/..."
         class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
     <\/div>
@@ -4143,7 +5465,28 @@ function eventFormFields(ev?: Event): string {
       <textarea name="description" rows="3"
         class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">${escHtml(ev?.description ?? '')}<\/textarea>
     <\/div>
-  <\/div>`;
+  <\/div>
+  <script>
+  (function() {
+    var select = document.getElementById('inventory-listing-select');
+    if (!select) return;
+    var fields = {
+      address: document.getElementById('inventory-property-address'),
+      agentName: document.getElementById('inventory-agent-name'),
+      agentEmail: document.getElementById('inventory-agent-email'),
+      agentPhone: document.getElementById('inventory-agent-phone'),
+      listingUrl: document.getElementById('inventory-listing-url')
+    };
+    select.addEventListener('change', function() {
+      var option = select.options[select.selectedIndex];
+      fields.address.value = option ? option.dataset.address || '' : '';
+      fields.agentName.value = option ? option.dataset.agentName || '' : '';
+      fields.agentEmail.value = option ? option.dataset.agentEmail || '' : '';
+      fields.agentPhone.value = option ? option.dataset.agentPhone || '' : '';
+      fields.listingUrl.value = option ? option.dataset.listingUrl || '' : '';
+    });
+  })();
+  <\/script>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -4174,4 +5517,8 @@ function equalHousingLogo(classes = ''): string {
   <\/div>`;
 }
 
-export default app;
+export default Object.assign(app, {
+  async scheduled(_event: ScheduledController, env: Bindings): Promise<void> {
+    await replayAttendance(env);
+  },
+});

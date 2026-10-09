@@ -4,3 +4,14 @@ dist/
 *.local
 .env
 .dev.vars
+
+# Local credentials, runtime state, and generated audit artifacts
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+.wrangler/
+.DS_Store
+.repo.yaml
+.cabinet-meta

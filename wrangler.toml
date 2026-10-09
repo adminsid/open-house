@@ -16,10 +16,37 @@ id = "1f8e09cbac794744a208e6b15a0dcaaa"
 binding = "BUCKET"
 bucket_name = "open-house-photos"
 
+[[services]]
+binding = "INVENTORY"
+service = "listing-input"
+
+[[services]]
+binding = "CRM"
+service = "re-crm"
+
 [[routes]]
 pattern = "openhouse.primeamericarealestate.com"
 custom_domain = true
 
 [vars]
-ADMIN_SECRET = "change-this-secret-in-production"
 APP_URL = "https://openhouse.primeamericarealestate.com"
+WORKSPACE_URL = "https://workspace.primeamericany.com"
+# Admin authentication is fully session-, tenant-, and CSRF-gated below.
+# Keep the emergency containment middleware available as a kill switch.
+CONTAINMENT_ENABLED = "false"
+# Server-side tenant assignment for legacy direct-login / first-run setup
+# sessions. Trusted config, never client-supplied. Direct login without this
+# produces a session with no tenant, which fails closed at every admin gate.
+ADMIN_TENANT_ID = "tenant_primeamerica"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# INTERNAL_API_SECRET is a Wrangler SECRET (never in [vars]):
+#   wrangler secret put INTERNAL_API_SECRET --name open-house
+# Must match the INTERNAL_API_SECRET value used by the Workspace worker.
+# Required by GET /api/events/list (server-to-server Workspace integration).
+
+[triggers]
+crons = ["*/5 * * * *"]
