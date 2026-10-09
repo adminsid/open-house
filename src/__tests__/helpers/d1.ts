@@ -30,7 +30,43 @@ export const APPLIED_MIGRATIONS = [
   '008_events_tenant_id.sql',
   '010_admin_sessions.sql',
   '011_media_ops.sql',
+  '012_p1_listing_crm_links.sql',
+  '013_p2_listing_snapshot_metadata.sql',
+  '014_attendance_delivery.sql',
 ];
+
+export const TEST_LISTING_ID = 'listing_test_1';
+
+export function mockInventory(): Fetcher {
+  const listing = {
+    id: TEST_LISTING_ID,
+    name: '9 Oak St',
+    tenantId: 'tenant_primeamerica',
+    propertyId: 'property_test_1',
+    createdBy: 'admin_1',
+    approvalStatus: 'approved',
+    publicationStatus: 'invite_only',
+    access: {
+      visibility: 'Invite Only',
+      inviteOnlyToken: 'invite-token-123',
+    },
+    data: {
+      fullAddress: '9 Oak St',
+      listAgentUserId: 'admin_1',
+      listAgentProfessionalLicenseId: 'license_test_1',
+      listAgentFullName: 'Alice',
+      listAgentEmail: 'alice@example.com',
+      listAgentDirectPhone: '555-0100',
+    },
+  };
+  return {
+    fetch: async (input: RequestInfo | URL) => {
+      const pathname = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url).pathname;
+      return Response.json(pathname.endsWith(`/${TEST_LISTING_ID}`) ? listing : { listings: [listing] });
+    },
+    connect: (() => { throw new Error('not implemented'); }) as Fetcher['connect'],
+  } as Fetcher;
+}
 
 interface D1Result {
   success: boolean;

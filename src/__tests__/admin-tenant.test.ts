@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import worker from '../index';
-import { SqliteD1 } from './helpers/d1';
+import { SqliteD1, TEST_LISTING_ID, mockInventory } from './helpers/d1';
 import { MockR2Bucket } from './helpers/r2';
 import { createSession } from '../lib/sessions';
 
@@ -31,6 +31,7 @@ async function makeEnv(db: SqliteD1): Promise<Record<string, unknown>> {
     APP_URL: ORIGIN,
     WORKSPACE_URL: WORKSPACE,
     CONTAINMENT_ENABLED: 'false',
+    INVENTORY: mockInventory(),
   };
 }
 
@@ -77,6 +78,7 @@ describe('tenant boundary on admin event operations', () => {
       },
       body: [
         'title=New+Tenant+A+Event',
+        `listing_id=${TEST_LISTING_ID}`,
         'property_address=9+Oak+St',
         'agent_name=Alice',
         'agent_email=alice%40example.com',
@@ -89,6 +91,109 @@ describe('tenant boundary on admin event operations', () => {
     const rows = db.query<{ tenant_id: string | null }>("SELECT tenant_id FROM events WHERE title = 'New Tenant A Event'");
     expect(rows).toHaveLength(1);
     expect(rows[0].tenant_id).toBe('tenant_primeamerica');
+  });
+
+  it('renders Inventory snapshot data so selecting a ready listing visibly prefills the form', async () => {
+    const token = await sessionToken(db, 'admin_1', 'tenant_primeamerica');
+    const res = await request('/admin/events/new', env, {
+      headers: { Cookie: `oh_session=${token}`, Accept: 'text/html' },
+    });
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`value="${TEST_LISTING_ID}"`);
+    expect(html).toContain('data-address="9 Oak St"');
+    expect(html).toContain('data-agent-name="Alice"');
+    expect(html).toContain('data-agent-email="alice@example.com"');
+    expect(html).toContain(`data-listing-url="${WORKSPACE}/public/listings/${TEST_LISTING_ID}?inviteToken=invite-token-123"`);
+    expect(html).toContain('id="inventory-listing-select"');
+    expect(html).toContain("addEventListener('change'");
+  });
+
+  it('allows an incomplete Inventory listing to be completed with editable event fields', async () => {
+    const incompleteListing = {
+      id: 'listing_incomplete',
+      name: '233 Utica Avenue',
+      tenantId: 'tenant_primeamerica',
+      data: { fullAddress: '233 Utica Avenue' },
+    };
+    env.INVENTORY = {
+      fetch: async (input: RequestInfo | URL) => {
+        const path = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url).pathname;
+        return Response.json(path.endsWith('/listing_incomplete') ? incompleteListing : { listings: [incompleteListing] });
+      },
+      connect: (() => { throw new Error('not implemented'); }) as Fetcher['connect'],
+    } as Fetcher;
+
+    const token = await sessionToken(db, 'admin_1', 'tenant_primeamerica');
+    const formPage = await request('/admin/events/new', env, {
+      headers: { Cookie: `oh_session=${token}`, Accept: 'text/html' },
+    });
+    const formHtml = await formPage.text();
+    expect(formHtml).toContain('233 Utica Avenue — details needed');
+    expect(formHtml).toContain('value="listing_incomplete"');
+    expect(formHtml).not.toContain('value="listing_incomplete" disabled');
+    expect(formHtml).not.toContain('name="property_address" readonly');
+
+    const res = await request('/admin/events/new', env, {
+      method: 'POST',
+      headers: {
+        Cookie: `oh_session=${token}`,
+        Origin: ORIGIN,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-CSRF-Token': await csrfOf(db, 'admin_1'),
+      },
+      body: [
+        'title=Legacy+Listing+Event',
+        'listing_id=listing_incomplete',
+        'property_address=233+Utica+Avenue',
+        'agent_name=Alice+Agent',
+        'agent_email=alice%40example.com',
+        'agent_phone=212-555-0100',
+        'start_time=2026-02-01T10%3A00',
+        'end_time=2026-02-01T12%3A00',
+        'timezone=America%2FNew_York',
+      ].join('&'),
+    });
+
+    expect(res.status).toBe(302);
+    const rows = db.query<{ listing_id: string | null; agent_name: string }>(
+      "SELECT listing_id, agent_name FROM events WHERE title = 'Legacy Listing Event'"
+    );
+    expect(rows).toEqual([{ listing_id: 'listing_incomplete', agent_name: 'Alice Agent' }]);
+  });
+
+  it('creates a manual event when the listing does not exist in Inventory', async () => {
+    const token = await sessionToken(db, 'admin_1', 'tenant_primeamerica');
+    const res = await request('/admin/events/new', env, {
+      method: 'POST',
+      headers: {
+        Cookie: `oh_session=${token}`,
+        Origin: ORIGIN,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-CSRF-Token': await csrfOf(db, 'admin_1'),
+      },
+      body: [
+        'title=Manual+Open+House',
+        'property_address=55+Manual+Lane',
+        'agent_name=Manual+Agent',
+        'agent_email=manual%40example.com',
+        'listing_url=https%3A%2F%2Fexample.com%2Flisting',
+        'start_time=2026-02-01T10%3A00',
+        'end_time=2026-02-01T12%3A00',
+        'timezone=America%2FNew_York',
+      ].join('&'),
+    });
+
+    expect(res.status).toBe(302);
+    const rows = db.query<{ listing_id: string | null; property_address: string; listing_url: string | null }>(
+      "SELECT listing_id, property_address, listing_url FROM events WHERE title = 'Manual Open House'"
+    );
+    expect(rows).toEqual([{
+      listing_id: null,
+      property_address: '55 Manual Lane',
+      listing_url: 'https://example.com/listing',
+    }]);
   });
 
   it('a session for another tenant cannot read or mutate a tenant-A event', async () => {

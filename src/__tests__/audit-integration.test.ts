@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import worker from '../index';
-import { SqliteD1 } from './helpers/d1';
+import { SqliteD1, TEST_LISTING_ID, mockInventory } from './helpers/d1';
 import { MockR2Bucket } from './helpers/r2';
 import { createSession } from '../lib/sessions';
 import { auditParams } from '../lib/audit';
@@ -33,6 +33,7 @@ async function makeEnv(db: SqliteD1): Promise<Record<string, unknown>> {
     WORKSPACE_URL: WORKSPACE,
     ADMIN_TENANT_ID: 'tenant_primeamerica',
     CONTAINMENT_ENABLED: 'false',
+    INVENTORY: mockInventory(),
   };
 }
 
@@ -148,6 +149,7 @@ describe('atomic privileged audit trail', () => {
       },
       body: [
         'title=New+Event',
+        `listing_id=${TEST_LISTING_ID}`,
         'property_address=9+Oak+St',
         'agent_name=Bob',
         'agent_email=bob%40example.com',

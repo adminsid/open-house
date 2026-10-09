@@ -52,6 +52,26 @@ describe('launch smoke: containment, agent 503, public routes', () => {
     return await worker.fetch(req, env as any, {} as any);
   }
 
+  it('exports the dedicated RSVP token so Workspace links resolve to the event', async () => {
+    env.INTERNAL_API_SECRET = 'test-event-feed-secret';
+    const response = await request('/api/events/list', {
+      headers: {
+        Authorization: 'Bearer test-event-feed-secret',
+        'X-Tenant-Id': 'tenant_primeamerica',
+      },
+    });
+    expect(response.status).toBe(200);
+    const { events } = await response.json() as {
+      events: { public_token: string; rsvp_token: string }[];
+    };
+    expect(events).toHaveLength(1);
+    expect(events[0].rsvp_token).toBe('rsvp_token_a');
+    expect(events[0].rsvp_token).not.toBe(events[0].public_token);
+    const rsvp = await request(`/rsvp/${events[0].rsvp_token}`);
+    expect(rsvp.status).toBe(200);
+    expect(await rsvp.text()).toContain('Prime Home');
+  });
+
   it('/admin/* reaches the authentication boundary when containment is disabled', async () => {
     expect((await request('/admin')).status).toBe(401);
     expect((await request('/admin/events/admin_token_a', { headers: { Accept: 'text/html' } })).status).toBe(302);
@@ -67,14 +87,14 @@ describe('launch smoke: containment, agent 503, public routes', () => {
     const signIn = await request('/e/public_token_a/signin', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'first_name=Joe&last_name=Smith&phone=5551234',
+      body: 'first_name=Joe&last_name=Smith&phone=5551234&consent_contact=1',
     });
     expect(signIn.status).toBe(302);
 
     const rsvp = await request('/rsvp/rsvp_token_a/submit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'first_name=Rita&last_name=Wong&phone=5559999',
+      body: 'first_name=Rita&last_name=Wong&phone=5559999&consent_contact=1',
     });
     expect(rsvp.status).toBe(302);
 

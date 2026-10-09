@@ -323,9 +323,11 @@ async function isReferenced(db: D1Database, key: string): Promise<boolean> {
 async function runDelete(env: { BUCKET: R2Bucket }, db: D1Database, op: MediaOpRecord): Promise<boolean> {
   try {
     if (await isReferenced(db, op.key)) {
-      // The object is still in use (e.g. a preceding op in the group did not
-      // complete). Block rather than delete; operator reviews via the UI.
-      return await attemptFailed(db, op, 'KEY_REFERENCED');
+      // The object is still in use by another event or column (e.g. duplicated event).
+      // We do not delete from R2 so other references stay intact, but the unlinking
+      // from this event succeeded. Mark done so the operation completes cleanly.
+      await markDone(db, op);
+      return true;
     }
     await env.BUCKET.delete(op.key);
     await markDone(db, op);

@@ -1,3 +1,5 @@
+import { captureOfflineAttendance } from './lib/offline-attendance';
+import { deliverAttendance, replayAttendance } from './lib/attendance-delivery';
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
 import { emitLog, generateRequestId } from './lib/logger';
@@ -38,6 +40,8 @@ type Bindings = {
   // test/CI environments; deployed configs must leave it unset so /admin
   // stays behind the 503 guard until the auth fix is fully verified.
   CONTAINMENT_ENABLED?: string;
+  INVENTORY: Fetcher;
+  CRM: Fetcher;
 };
 
 type Admin = {
@@ -72,6 +76,15 @@ type Event = {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  tenant_id: string;
+  listing_id: string | null;
+  property_id: string | null;
+  agent_user_id: string | null;
+  professional_license_id: string | null;
+  listing_source: string | null;
+  listing_source_version: string | null;
+  listing_snapshot_synced_at: string | null;
+  listing_snapshot_json: string | null;
 };
 
 type GuestAnalytics = {
@@ -100,6 +113,31 @@ type Guest = {
   is_rsvp: number;
   checked_in: number;
   checked_in_at: string | null;
+  crm_contact_id: string | null;
+  consent_contact: number;
+  consent_marketing: number;
+  consent_captured_at: string | null;
+  crm_sync_status: string;
+  crm_synced_at: string | null;
+};
+
+type InventoryListing = {
+  id: string;
+  name: string;
+  status?: string | null;
+  listingStatus?: string | null;
+  approvalStatus?: string | null;
+  publicationStatus?: string | null;
+  isArchived?: boolean;
+  tenantId?: string | null;
+  propertyId?: string | null;
+  createdBy?: string | null;
+  updatedAt?: string | null;
+  data?: Record<string, unknown>;
+  access?: {
+    visibility?: string | null;
+    inviteOnlyToken?: string | null;
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +154,14 @@ function generateToken(byteLength: number = 16): string {
     .join('');
 }
 
+function normalizePhone(phone: string | null | undefined): string {
+  return (phone ?? '').replace(/\D/g, '');
+}
+
+function normalizeEmail(email: string | null | undefined): string {
+  return (email ?? '').trim().toLowerCase();
+}
+
 function getUserSession(c: any): { id?: string; email?: string; name?: string; role?: string } | null {
   // Identity is taken ONLY from the validated server-side session (captured
   // at SSO validation time). The legacy unsigned openhouse_user cookie is
@@ -130,9 +176,11 @@ function getUserSession(c: any): { id?: string; email?: string; name?: string; r
   };
 }
 
-function isUserAssignedToEvent(user: { email?: string; name?: string; role?: string } | null, ev: Event): boolean {
+function isUserAssignedToEvent(user: { id?: string; email?: string; name?: string; role?: string } | null, ev: Event): boolean {
   if (!user) return false; // fail closed: no trusted identity, no assignment
   if (user.role === 'admin' || user.role === 'broker') return true;
+  if (ev.agent_user_id) return Boolean(user.id && user.id === ev.agent_user_id);
+  // Legacy events created before stable agent relationships were introduced.
   const userEmail = (user.email || '').toLowerCase().trim();
   const userName = (user.name || '').toLowerCase().trim();
   const evEmail = (ev.agent_email || '').toLowerCase().trim();
@@ -156,6 +204,111 @@ function sessionTenant(c: any): string {
     throw new AuthError('No validated server-side tenant for request');
   }
   return session.tenantId;
+}
+
+function inventoryHeaders(c: any): Record<string, string> {
+  const session = c.get('session') as Session | undefined;
+  return {
+    Accept: 'application/json',
+    ...(c.env.INTERNAL_API_SECRET ? { Authorization: `Bearer ${c.env.INTERNAL_API_SECRET}` } : {}),
+    'X-User-Id': session?.userId || 'open-house',
+    'X-User-Role': session?.role || 'agent',
+    'X-Tenant-Id': sessionTenant(c),
+    'X-User-Email': session?.userEmail || '',
+    'X-User-Name': session?.userName || '',
+  };
+}
+
+async function loadInventoryListings(c: any): Promise<InventoryListing[]> {
+  if (!c.env.INVENTORY) return [];
+  const response = await c.env.INVENTORY.fetch('https://inventory.internal/api/listings', {
+    headers: inventoryHeaders(c),
+  });
+  if (!response.ok) return [];
+  const body = await response.json() as any;
+  return Array.isArray(body?.listings) ? body.listings : [];
+}
+
+async function resolveInventoryListing(c: any, listingId: string): Promise<InventoryListing | null> {
+  if (!listingId) return null;
+  const response = await c.env.INVENTORY.fetch(`https://inventory.internal/api/listings/${encodeURIComponent(listingId)}`, {
+    headers: inventoryHeaders(c),
+  });
+  if (!response.ok) return null;
+  const listing = await response.json() as InventoryListing;
+  return listing?.tenantId === sessionTenant(c) ? listing : null;
+}
+
+function guestListingUrl(listing: InventoryListing): string | null {
+  if (listing.isArchived) return null;
+  const data = listing.data || {};
+  const status = String(data.listingStatus || listing.listingStatus || listing.status || '')
+    .trim().toLowerCase().replace(/\s+/g, '_');
+  if (['closed', 'expired', 'withdrawn', 'canceled', 'cancelled'].includes(status)) return null;
+
+  const visibility = String(listing.access?.visibility || data.accessVisibility || listing.publicationStatus || '')
+    .trim().toLowerCase().replace(/\s+/g, '_');
+  const baseUrl = `https://workspace.primeamericany.com/public/listings/${encodeURIComponent(listing.id)}`;
+  if (visibility === 'invite_only') {
+    const inviteToken = String(listing.access?.inviteOnlyToken || '').trim();
+    return inviteToken ? `${baseUrl}?inviteToken=${encodeURIComponent(inviteToken)}` : null;
+  }
+  if (visibility === 'public' && listing.approvalStatus === 'approved' && status === 'active') {
+    return baseUrl;
+  }
+  return null;
+}
+
+function listingSnapshot(listing: InventoryListing) {
+  const data = listing.data || {};
+  const address = String(data.fullAddress || [data.streetNumber, data.streetName, data.unitNumber, data.city, data.stateOrProvince, data.postalCode].filter(Boolean).join(' ') || listing.name).trim();
+  return {
+    listingId: listing.id,
+    propertyId: listing.propertyId || null,
+    agentUserId: String(data.listAgentUserId || listing.createdBy || '').trim(),
+    professionalLicenseId: String(data.listAgentProfessionalLicenseId || '').trim() || null,
+    agentName: String(data.listAgentFullName || '').trim(),
+    agentEmail: String(data.listAgentEmail || '').trim(),
+    agentPhone: String(data.listAgentDirectPhone || '').trim() || null,
+    address,
+    listingUrl: guestListingUrl(listing),
+    source: 'listing-input',
+    sourceVersion: listing.updatedAt || null,
+    syncedAt: new Date().toISOString(),
+  };
+}
+
+function eventCreationError(message: string, status: 400 | 404 | 422, listingId?: string): Response {
+  const inventoryLink = listingId
+    ? `<a href="https://inventory.primeamericarealestate.com/listings/${encodeURIComponent(listingId)}"
+         class="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700">
+         Open listing in Inventory
+       <\/a>`
+    : '';
+  return new Response(
+    pageShell(
+      'Event not created',
+      `<div class="flex min-h-screen items-center justify-center px-4">
+        <div class="w-full max-w-lg rounded-2xl bg-white p-8 text-center shadow">
+          <h1 class="mb-3 text-xl font-bold text-red-600">Event not created<\/h1>
+          <p class="mb-6 text-gray-700">${escHtml(message)}<\/p>
+          <div class="flex flex-wrap justify-center gap-3">
+            ${inventoryLink}
+            <a href="/admin/events/new" class="inline-flex items-center justify-center rounded-lg border border-gray-300 px-4 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">Back to New Event<\/a>
+          <\/div>
+        <\/div>
+      <\/div>`
+    ),
+    { status, headers: { 'Content-Type': 'text/html; charset=UTF-8' } }
+  );
+}
+
+async function syncGuestToCrm(c: any, _event: Event, guest: {
+  id: string; firstName: string; lastName: string; email: string | null; phone: string | null;
+  address: string | null; notes: string | null; consentMarketing: number; consentCapturedAt: string;
+  occurredAt: string;
+}): Promise<void> {
+  await deliverAttendance(c.env, guest.id);
 }
 
 /**
@@ -937,6 +1090,84 @@ app.use('/admin/*', adminRequireAuth, adminRequireTenant, adminRequireCsrf, admi
 app.get('/', (c) => c.redirect('/admin'));
 
 // ---------------------------------------------------------------------------
+// Internal Server-to-Server API — Workspace integration
+// ---------------------------------------------------------------------------
+// GET /api/events/list
+// Called by the Workspace worker proxy (/api/openhouses) using
+// Authorization: Bearer <INTERNAL_API_SECRET>.  Never user-facing.
+app.post('/api/attendance-capture', c => captureOfflineAttendance(c.req.raw, c.env));
+
+app.get('/api/events/list', async (c) => {
+  // Validate internal secret
+  const authHeader = c.req.header('Authorization') || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const secret = (c.env as any).INTERNAL_API_SECRET as string | undefined;
+  if (!secret || !token || token !== secret) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    const now = new Date().toISOString();
+    const tenantId = c.req.header('X-Tenant-Id')?.trim();
+    if (!tenantId) return c.json({error:'Tenant context required'},403);
+    const result = await c.env.DB
+      .prepare(
+        `SELECT id, tenant_id, listing_id, property_id, agent_user_id, professional_license_id,
+                title, property_address, agent_name, agent_email, agent_phone,
+                start_time, end_time, timezone, listing_url, photo_key, status,
+                public_token, rsvp_token, created_at, updated_at
+           FROM events
+          WHERE deleted_at IS NULL
+            AND tenant_id = ?
+          ORDER BY start_time DESC
+          LIMIT 100`
+      )
+      .bind(tenantId)
+      .all<Event>();
+
+    const events = (result.results || []).map((ev) => {
+      const start = new Date(ev.start_time);
+      const end = new Date(ev.end_time);
+      const nowDate = new Date(now);
+      let computedStatus = ev.status;
+      if (ev.status !== 'cancelled' && ev.status !== 'achieved') {
+        if (nowDate < start) computedStatus = 'scheduled';
+        else if (nowDate >= start && nowDate <= end) computedStatus = 'happening_now';
+        else computedStatus = 'ended';
+      }
+      return {
+        id: ev.id,
+        tenant_id: ev.tenant_id,
+        listing_id: ev.listing_id,
+        property_id: ev.property_id,
+        agent_user_id: ev.agent_user_id,
+        professional_license_id: ev.professional_license_id,
+        title: ev.title,
+        property_address: ev.property_address,
+        agent_name: ev.agent_name,
+        agent_email: ev.agent_email,
+        agent_phone: ev.agent_phone,
+        start_time: ev.start_time,
+        end_time: ev.end_time,
+        timezone: ev.timezone,
+        listing_url: ev.listing_url,
+        photo_key: ev.photo_key,
+        status: computedStatus,
+        public_token: ev.public_token,
+        rsvp_token: ev.rsvp_token,
+        created_at: ev.created_at,
+        updated_at: ev.updated_at,
+      };
+    });
+
+    return c.json({ events });
+  } catch (err: any) {
+    console.error('[api/events/list]', err?.message ?? err);
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Setup Flow
 // ---------------------------------------------------------------------------
 
@@ -1284,7 +1515,7 @@ app.get('/e/:token', async (c) => {
           <p class="text-gray-500 text-sm mt-1">Please sign in &mdash; we&rsquo;d love to stay in touch<\/p>
           <div class="divider mt-4"><\/div>
         <\/div>
-        <form method="POST" action="/e/${escHtml(token)}/signin" class="space-y-4">
+        <form method="POST" action="/e/${escHtml(token)}/signin" class="space-y-4" onsubmit="var b=document.getElementById('signin-submit-btn');if(b){b.disabled=true;b.innerText='Signing In...';b.classList.add('opacity-75');}">
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">First Name <span class="text-red-400">*<\/span><\/label>
@@ -1351,8 +1582,18 @@ app.get('/e/:token', async (c) => {
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
               placeholder="Anything you&rsquo;d like the agent to know&hellip;"><\/textarea>
           <\/div>
+          <div class="space-y-2 rounded-xl bg-gray-50 p-3 text-xs text-gray-600">
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_contact" value="1" required class="mt-0.5" style="accent-color:var(--gold)" \/>
+              <span>I agree that the event&rsquo;s real estate professional may contact me about this property and my visit. <span class="text-red-400">*<\/span><\/span>
+            <\/label>
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_marketing" value="1" class="mt-0.5" style="accent-color:var(--gold)" \/>
+              <span>I would also like occasional real estate updates and marketing messages. Optional.<\/span>
+            <\/label>
+          <\/div>
           <div class="pt-1">
-            <button type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
+            <button id="signin-submit-btn" type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
               &#10003; &nbsp;Sign In to Open House
             <\/button>
           <\/div>
@@ -1446,16 +1687,30 @@ app.post('/e/:token/signin', async (c) => {
   const isAgent = form.get('is_agent') === '1' ? 1 : 0;
   const howDidYouHear = (form.get('how_did_you_hear') as string | null)?.trim() || null;
   const notes = (form.get('notes') as string | null)?.trim() || null;
+  const consentContact = form.get('consent_contact') === '1' ? 1 : 0;
+  const consentMarketing = form.get('consent_marketing') === '1' ? 1 : 0;
+
+  if (!consentContact) {
+    return c.html(guestPageShell('Consent Required', '<div class="flex items-center justify-center min-h-screen p-8"><div class="glass-card rounded-2xl p-8 text-center"><h1 class="text-lg font-bold mb-2">Consent is required<\/h1><p class="text-gray-500 text-sm">Please agree to property-specific contact so the hosting professional can follow up about your visit.<\/p><\/div><\/div>'), 400);
+  }
 
   const guestId = generateId();
   const now = new Date().toISOString();
 
   await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, address, is_agent, how_did_you_hear, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, address, is_agent,
+       how_did_you_hear, notes, signed_in_at, follow_up_status, consent_contact, consent_marketing,
+       consent_captured_at, crm_sync_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 'pending')`
   )
-    .bind(guestId, event.id, firstName, lastName, email, phone, address, isAgent, howDidYouHear, notes, now)
+    .bind(guestId, event.id, firstName, lastName, email, phone, address, isAgent, howDidYouHear, notes, now,
+      consentContact, consentMarketing, now)
     .run();
+
+  await syncGuestToCrm(c, event, {
+    id: guestId, firstName, lastName, email, phone, address, notes,
+    consentMarketing, consentCapturedAt: now, occurredAt: now,
+  });
 
   return c.redirect(`/e/${token}/success`);
 });
@@ -2498,14 +2753,15 @@ function buildTabBar(activeFilter: string, counts: Record<string, number>, view:
 // Admin: new event form
 // ---------------------------------------------------------------------------
 
-app.get('/admin/events/new', (c) => {
+app.get('/admin/events/new', async (c) => {
+  const listings = await loadInventoryListings(c);
   const body = `
 ${adminNav()}
 <div class="max-w-2xl mx-auto px-4 py-10">
   <h1 class="text-2xl font-bold text-gray-900 mb-6">Create New Event<\/h1>
   <div class="bg-white rounded-2xl shadow p-6">
     <form method="POST" action="/admin/events/new" class="space-y-5">
-      ${eventFormFields()}
+      ${eventFormFields(undefined, listings)}
       <div class="flex justify-end pt-2">
         <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-2.5 rounded-lg transition-colors">
           Create Event
@@ -2525,6 +2781,9 @@ app.post('/admin/events/new', async (c) => {
   const form = await c.req.formData();
 
   const title = (form.get('title') as string | null)?.trim() ?? '';
+  const listingId = (form.get('listing_id') as string | null)?.trim() ?? '';
+  const listing = listingId ? await resolveInventoryListing(c, listingId) : null;
+  const snapshot = listing ? listingSnapshot(listing) : null;
   const property_address = (form.get('property_address') as string | null)?.trim() ?? '';
   const agent_name = (form.get('agent_name') as string | null)?.trim() ?? '';
   const agent_email = (form.get('agent_email') as string | null)?.trim() ?? '';
@@ -2536,20 +2795,21 @@ app.post('/admin/events/new', async (c) => {
   const timezone = (form.get('timezone') as string | null)?.trim() || 'America/New_York';
   const listing_url = (form.get('listing_url') as string | null)?.trim() || null;
 
-  if (!title || !property_address || !agent_name || !agent_email || !start_time || !end_time) {
-    return c.html(
-      pageShell(
-        'Error',
-        `<div class="flex items-center justify-center min-h-screen">
-          <div class="text-center p-8">
-            <h1 class="text-xl font-bold text-red-600 mb-2">Missing required fields<\/h1>
-            <a href="/admin/events/new" class="text-indigo-600 underline">Go back<\/a>
-          <\/div>
-        <\/div>`
-      ),
-      400
-    );
+  if (!title || !start_time || !end_time || !property_address || !agent_name || !agent_email) {
+    return eventCreationError('Complete the title, property address, agent name, agent email, start time, and end time.', 400);
   }
+
+  const session = c.get('session') as Session | undefined;
+  const effectiveAgentUserId = snapshot?.agentUserId
+    || (session?.userEmail && session.userEmail.toLowerCase() === agent_email.toLowerCase() ? session.userId : null);
+  const effectiveSnapshot = snapshot ? {
+    ...snapshot,
+    address: property_address,
+    agentName: agent_name,
+    agentEmail: agent_email,
+    agentPhone: agent_phone,
+    listingUrl: listing_url,
+  } : null;
 
   const id = generateId();
   const admin_token = generateToken(16);
@@ -2562,10 +2822,18 @@ app.post('/admin/events/new', async (c) => {
 
   try {
     const insertStmt = c.env.DB.prepare(
-      `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO events (id, listing_id, property_id, agent_user_id, professional_license_id,
+        listing_source, listing_source_version, listing_snapshot_synced_at, listing_snapshot_json,
+        title, property_address, agent_name, agent_email, agent_phone, company_name, description,
+        start_time, end_time, timezone, listing_url, status, admin_token, public_token, rsvp_token,
+        tenant_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
     )
-      .bind(id, title, property_address, agent_name, agent_email, agent_phone, company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token, rsvp_token, sessionTenant(c), now, now);
+      .bind(id, snapshot?.listingId || null, snapshot?.propertyId || null, effectiveAgentUserId, snapshot?.professionalLicenseId || null,
+        snapshot?.source || null, snapshot?.sourceVersion || null, snapshot?.syncedAt || null, effectiveSnapshot ? JSON.stringify(effectiveSnapshot) : null,
+        title, property_address, agent_name, agent_email, agent_phone,
+        company_name, description, startUtc, endUtc, timezone, listing_url, admin_token, public_token,
+        rsvp_token, sessionTenant(c), now, now);
 
     await commitAudited(c, { action: 'admin.event.create', targetType: 'event', targetId: id }, [insertStmt]);
 
@@ -2594,6 +2862,37 @@ app.post('/admin/events/new', async (c) => {
 // Admin: event detail page
 // ---------------------------------------------------------------------------
 
+// Uses the same session, tenant, assignment and CSRF gates as event management.
+app.get('/admin/events/:adminToken/crm-delivery', async (c) => {
+  const event = await c.env.DB.prepare('SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?')
+    .bind(c.req.param('adminToken'), sessionTenant(c)).first<Event>();
+  if (!event) return c.notFound();
+  if (!isUserAssignedToEvent(getUserSession(c), event)) return c.text('Forbidden', 403);
+  const guests = await c.env.DB.prepare(`SELECT id, crm_sync_status, crm_attempts, crm_error_code
+    FROM guests WHERE event_id = ? AND consent_contact = 1 ORDER BY signed_in_at DESC`).bind(event.id)
+    .all<{ id: string; crm_sync_status: string; crm_attempts: number; crm_error_code: string | null }>();
+  return c.html(pageShell('CRM delivery', `<main class="max-w-3xl mx-auto p-8"><h1>CRM delivery</h1>
+    <p>Attendance is saved on the server. CRM delivery is a separate acknowledgment.
+    Repair the event agent assignment before retrying rejected attendance.</p>
+    ${guests.results.map(g => `<div class="border p-4 my-3"><p>${escHtml(g.id)} — ${escHtml(g.crm_sync_status)}
+      (${g.crm_attempts} attempts) ${escHtml(g.crm_error_code || '')}</p>
+      ${g.crm_sync_status !== 'synced' ? `<form method="post" action="/admin/events/${escHtml(event.admin_token)}/crm-delivery/${escHtml(g.id)}/retry"><button>Retry delivery</button></form>` : ''}</div>`).join('')}</main>`));
+});
+app.post('/admin/events/:adminToken/crm-delivery/:guestId/retry', async (c) => {
+  const event = await c.env.DB.prepare('SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?')
+    .bind(c.req.param('adminToken'), sessionTenant(c)).first<Event>();
+  if (!event) return c.notFound();
+  if (!isUserAssignedToEvent(getUserSession(c), event)) return c.text('Forbidden', 403);
+  const guestId = c.req.param('guestId');
+  await commitAudited(c, { action: 'admin.attendance.retry', targetType: 'guest', targetId: guestId }, [
+    c.env.DB.prepare(`UPDATE guests SET crm_attempts = 0, crm_sync_status = 'pending', crm_next_attempt_at = NULL,
+      crm_lease = NULL, crm_error_code = NULL WHERE id = ? AND event_id = ? AND crm_sync_status <> 'synced'
+      AND (crm_lease IS NULL OR crm_next_attempt_at <= ?)`)
+      .bind(guestId, event.id, new Date().toISOString()),
+  ]);
+  return c.redirect(`/admin/events/${event.admin_token}/crm-delivery`);
+});
+
 app.get('/admin/events/:adminToken', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
@@ -2612,7 +2911,7 @@ app.get('/admin/events/:adminToken', async (c) => {
   const userSession = getUserSession(c);
   if (!isUserAssignedToEvent(userSession, event)) {
     return c.html(
-      pageShell('Forbidden', '<div class="max-w-xl mx-auto py-20 px-4 text-center"><h1 class="text-2xl font-bold text-red-600 mb-2">Access Restricted<\/h1><p class="text-gray-600 mb-6">You are not assigned to manage this open house event. Only the assigned agent or a broker/admin can manage event details.<\/p><a href="/admin" class="inline-block bg-indigo-600 text-white font-medium px-4 py-2 rounded-lg hover:bg-indigo-700">Back to Events<\/a><\/div>'),
+      pageShell('Forbidden', '<div class="max-w-xl mx-auto py-20 px-4 text-center"><a class="text-indigo-600 underline" href="/admin/events/${escHtml(event.admin_token)}/crm-delivery">CRM delivery and repair</a><h1 class="text-2xl font-bold text-red-600 mb-2">Access Restricted<\/h1><p class="text-gray-600 mb-6">You are not assigned to manage this open house event. Only the assigned agent or a broker/admin can manage event details.<\/p><a href="/admin" class="inline-block bg-indigo-600 text-white font-medium px-4 py-2 rounded-lg hover:bg-indigo-700">Back to Events<\/a><\/div>'),
       403
     );
   }
@@ -2961,7 +3260,7 @@ ${followUpModal}
       <div class="bg-white rounded-xl shadow p-6">
         <h2 class="font-semibold text-gray-900 mb-4">Event Details<\/h2>
         <form method="POST" action="/admin/events/${escHtml(adminToken)}/update" class="space-y-4">
-          ${eventFormFields(event)}
+          ${eventFormFields(event, await loadInventoryListings(c))}
           <div class="flex justify-end pt-1">
             <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-5 py-2 rounded-lg transition-colors text-sm">Save Changes<\/button>
           <\/div>
@@ -3194,15 +3493,41 @@ function toggleAgent2(checked) {
 app.post('/admin/events/:adminToken/update', async (c) => {
   const adminToken = c.req.param('adminToken');
   const event = await c.env.DB.prepare(
-    'SELECT id FROM events WHERE admin_token = ? AND tenant_id = ?'
+    'SELECT * FROM events WHERE admin_token = ? AND tenant_id = ?'
   )
     .bind(adminToken, sessionTenant(c))
-    .first<Pick<Event, 'id'>>();
+    .first<Event>();
 
   if (!event) return c.notFound();
 
   const form = await c.req.formData();
   const now = new Date().toISOString();
+  const listingId = (form.get('listing_id') as string | null)?.trim() || '';
+  const listing = listingId ? await resolveInventoryListing(c, listingId) : null;
+  const snapshot = listing ? listingSnapshot(listing) : null;
+  const title = (form.get('title') as string | null)?.trim() || '';
+  const propertyAddress = (form.get('property_address') as string | null)?.trim() || '';
+  const agentName = (form.get('agent_name') as string | null)?.trim() || '';
+  const agentEmail = (form.get('agent_email') as string | null)?.trim() || '';
+  const agentPhone = (form.get('agent_phone') as string | null)?.trim() || null;
+  const listingUrl = (form.get('listing_url') as string | null)?.trim() || null;
+  if (!title || !propertyAddress || !agentName || !agentEmail) {
+    return c.json({ error: 'Title, property address, agent name, and agent email are required.' }, 400);
+  }
+
+  const session = c.get('session') as Session | undefined;
+  const retainingExistingLink = Boolean(listingId && listingId === event.listing_id && !snapshot);
+  const effectiveAgentUserId = snapshot?.agentUserId
+    || (session?.userEmail && session.userEmail.toLowerCase() === agentEmail.toLowerCase() ? session.userId : null)
+    || (retainingExistingLink ? event.agent_user_id : null);
+  const effectiveSnapshot = snapshot ? {
+    ...snapshot,
+    address: propertyAddress,
+    agentName,
+    agentEmail,
+    agentPhone,
+    listingUrl,
+  } : null;
 
   const startTimeUtc = toUtc((form.get('start_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
   const endTimeUtc = toUtc((form.get('end_time') as string)?.trim(), (form.get('timezone') as string)?.trim() || 'America/New_York');
@@ -3210,25 +3535,36 @@ app.post('/admin/events/:adminToken/update', async (c) => {
   try {
     const updateStmt = c.env.DB.prepare(
       `UPDATE events SET
+        listing_id = ?, property_id = ?, agent_user_id = ?, professional_license_id = ?,
+        listing_source = ?, listing_source_version = ?, listing_snapshot_synced_at = ?, listing_snapshot_json = ?,
         title = ?, property_address = ?, agent_name = ?, agent_email = ?, agent_phone = ?,
         company_name = ?, description = ?, start_time = ?, end_time = ?, timezone = ?,
         listing_url = ?, updated_at = ?
-       WHERE admin_token = ?`
+       WHERE admin_token = ? AND tenant_id = ?`
     )
       .bind(
-        (form.get('title') as string)?.trim(),
-        (form.get('property_address') as string)?.trim(),
-        (form.get('agent_name') as string)?.trim(),
-        (form.get('agent_email') as string)?.trim(),
-        (form.get('agent_phone') as string | null)?.trim() || null,
+        snapshot?.listingId ?? (retainingExistingLink ? event.listing_id : null),
+        snapshot?.propertyId ?? (retainingExistingLink ? event.property_id : null),
+        effectiveAgentUserId,
+        snapshot?.professionalLicenseId ?? (retainingExistingLink ? event.professional_license_id : null),
+        snapshot?.source ?? (retainingExistingLink ? event.listing_source : null),
+        snapshot?.sourceVersion ?? (retainingExistingLink ? event.listing_source_version : null),
+        snapshot?.syncedAt ?? (retainingExistingLink ? event.listing_snapshot_synced_at : null),
+        effectiveSnapshot ? JSON.stringify(effectiveSnapshot) : (retainingExistingLink ? event.listing_snapshot_json : null),
+        title,
+        propertyAddress,
+        agentName,
+        agentEmail,
+        agentPhone,
         (form.get('company_name') as string | null)?.trim() || null,
         (form.get('description') as string | null)?.trim() || null,
         startTimeUtc,
         endTimeUtc,
         (form.get('timezone') as string)?.trim() || 'America/New_York',
-        (form.get('listing_url') as string | null)?.trim() || null,
+        listingUrl,
         now,
-        adminToken
+        adminToken,
+        sessionTenant(c)
       );
 
     await commitAudited(c, { action: 'admin.event.update', targetType: 'event', targetId: event.id }, [updateStmt]);
@@ -3823,13 +4159,23 @@ app.post('/admin/events/:adminToken/duplicate', async (c) => {
 
   try {
     const insertStmt = c.env.DB.prepare(
-      `INSERT INTO events (id, title, property_address, agent_name, agent_email, agent_phone, company_name,
+      `INSERT INTO events (id, listing_id, property_id, agent_user_id, professional_license_id,
+         listing_source, listing_source_version, listing_snapshot_synced_at, listing_snapshot_json,
+         title, property_address, agent_name, agent_email, agent_phone, company_name,
          description, start_time, end_time, timezone, listing_url, photo_key, agent_photo_key, agent_photo_2_key, flyer_key,
          status, admin_token, public_token, rsvp_token, tenant_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         newId,
+        source.listing_id,
+        source.property_id,
+        source.agent_user_id,
+        source.professional_license_id,
+        source.listing_source,
+        source.listing_source_version,
+        source.listing_snapshot_synced_at,
+        source.listing_snapshot_json,
         // Strip existing "(Copy)" suffix to avoid "Event (Copy) (Copy) (Copy)..." stacking
         `${source.title.replace(/\s*\(Copy\)\s*$/, '').trim()} (Copy)`,
         source.property_address,
@@ -4505,7 +4851,7 @@ app.get('/rsvp/:rsvpToken', async (c) => {
           <p class="text-gray-500 text-sm mt-1">Reserve your spot &mdash; we&rsquo;d love to see you there</p>
           <div class="divider mt-4"></div>
         </div>
-        <form method="POST" action="/rsvp/${escHtml(rsvpToken)}/submit" class="space-y-4">
+        <form method="POST" action="/rsvp/${escHtml(rsvpToken)}/submit" class="space-y-4" onsubmit="var b=document.getElementById('rsvp-submit-btn');if(b){b.disabled=true;b.innerText='Submitting...';b.classList.add('opacity-75');}">
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">First Name <span class="text-red-400">*</span></label>
@@ -4538,8 +4884,18 @@ app.get('/rsvp/:rsvpToken', async (c) => {
               class="input-field w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-2.5 text-sm text-gray-800"
               placeholder="Anything you'd like to ask?"></textarea>
           </div>
+          <div class="space-y-2 rounded-xl bg-gray-50 p-3 text-xs text-gray-600">
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_contact" value="1" required class="mt-0.5" style="accent-color:var(--gold)" />
+              <span>I agree that the event&rsquo;s real estate professional may contact me about this property and my RSVP. <span class="text-red-400">*</span></span>
+            </label>
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" name="consent_marketing" value="1" class="mt-0.5" style="accent-color:var(--gold)" />
+              <span>I would also like occasional real estate updates and marketing messages. Optional.</span>
+            </label>
+          </div>
           <div class="pt-1">
-            <button type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
+            <button id="rsvp-submit-btn" type="submit" class="btn-gold w-full font-bold py-3.5 rounded-xl text-sm shadow-lg">
               Confirm My RSVP
             </button>
           </div>
@@ -4603,14 +4959,72 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
 
   const email = (form.get('email') as string | null)?.trim() || null;
   const notes = (form.get('notes') as string | null)?.trim() || null;
+  const consentContact = form.get('consent_contact') === '1' ? 1 : 0;
+  const consentMarketing = form.get('consent_marketing') === '1' ? 1 : 0;
+  if (!consentContact) return c.redirect(`/rsvp/${rsvpToken}`);
   const now = new Date().toISOString();
 
-  await c.env.DB.prepare(
-    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes, signed_in_at, follow_up_status)
-     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending')`
+  // Normalize for deduplication: digits-only phone, lowercase email.
+  const normPhone = normalizePhone(phone);
+  const normEmail = normalizeEmail(email);
+
+  // Look for an existing RSVP for this event by email (preferred) or phone.
+  const existing = await c.env.DB.prepare(
+    `SELECT id FROM guests
+     WHERE event_id = ? AND is_rsvp = 1
+       AND (
+         (email IS NOT NULL AND trim(email) != '' AND lower(trim(email)) = ?)
+         OR
+         (? != '' AND phone IS NOT NULL AND replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+','') = ?)
+       )
+     ORDER BY signed_in_at DESC LIMIT 1`
   )
-    .bind(generateId(), event.id, firstName, lastName, email, phone, notes, now)
+    .bind(event.id, normEmail, normPhone, normPhone)
+    .first<{ id: string }>();
+
+  if (existing) {
+    // UPDATE the existing RSVP record with the latest information.
+    await c.env.DB.prepare(
+      `UPDATE guests
+       SET first_name = ?, last_name = ?, phone = ?,
+           email = CASE WHEN ? != '' THEN ? ELSE email END,
+           notes = CASE WHEN ? IS NOT NULL THEN ? ELSE notes END,
+           consent_contact = ?, consent_marketing = ?,
+           consent_captured_at = ?
+       WHERE id = ?`
+    )
+      .bind(
+        firstName, lastName, phone,
+        normEmail, email,
+        notes, notes,
+        consentContact, consentMarketing, now,
+        existing.id
+      )
+      .run();
+
+    await syncGuestToCrm(c, event, {
+      id: existing.id, firstName, lastName, email, phone, address: null, notes,
+      consentMarketing, consentCapturedAt: now, occurredAt: now,
+    });
+
+    return c.redirect(`/rsvp/${rsvpToken}/success?updated=1`);
+  }
+
+  // INSERT a new RSVP record.
+  const guestId = generateId();
+  await c.env.DB.prepare(
+    `INSERT INTO guests (id, event_id, first_name, last_name, email, phone, is_rsvp, notes,
+       signed_in_at, follow_up_status, consent_contact, consent_marketing, consent_captured_at, crm_sync_status)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', ?, ?, ?, 'pending')`
+  )
+    .bind(guestId, event.id, firstName, lastName, email, phone, notes, now,
+      consentContact, consentMarketing, now)
     .run();
+
+  await syncGuestToCrm(c, event, {
+    id: guestId, firstName, lastName, email, phone, address: null, notes,
+    consentMarketing, consentCapturedAt: now, occurredAt: now,
+  });
 
   return c.redirect(`/rsvp/${rsvpToken}/success`);
 });
@@ -4621,6 +5035,7 @@ app.post('/rsvp/:rsvpToken/submit', async (c) => {
 
 app.get('/rsvp/:rsvpToken/success', async (c) => {
   const rsvpToken = c.req.param('rsvpToken');
+  const isUpdated = c.req.query('updated') === '1';
   const event = await c.env.DB.prepare(
     'SELECT title, agent_name, agent_email, agent_phone, company_name, agent_photo_key, agent_photo_2_key, photo_key, start_time, end_time, timezone, property_address, flyer_key FROM events WHERE rsvp_token = ?'
   )
@@ -4644,6 +5059,15 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
     .slice(0, 2)
     .toUpperCase() || '??';
 
+  const successHero = isUpdated
+    ? `<div class="text-6xl mb-4">🔄</div>
+       <h1 class="text-2xl font-bold text-gray-900 mb-2">RSVP Updated! 🎉</h1>
+       <p class="text-gray-600 mb-1">You're already registered for <strong>${escHtml(title)}</strong>.</p>
+       <p class="text-gray-500 text-sm mb-4">We've updated your contact information with the latest details — see you there!</p>`
+    : `<div class="text-6xl mb-4">✅</div>
+       <h1 class="text-2xl font-bold text-gray-900 mb-2">You're On The List!</h1>
+       <p class="text-gray-600 mb-3">You've successfully RSVP'd for <strong>${escHtml(title)}</strong>.</p>`;
+
   const body = `
 <div style="background-color:var(--navy);min-height:100vh">
   ${photoUrl
@@ -4654,9 +5078,7 @@ app.get('/rsvp/:rsvpToken/success', async (c) => {
     : `<div class="h-20" style="background:linear-gradient(135deg,#1a3557 0%,#0f1c2e 100%)"></div>`}
   <div class="max-w-lg mx-auto px-4 pb-12 -mt-6 relative">
     <div class="glass-card rounded-2xl shadow-2xl p-8 text-center anim-1">
-      <div class="text-6xl mb-4">✅</div>
-      <h1 class="text-2xl font-bold text-gray-900 mb-2">You're On The List!</h1>
-      <p class="text-gray-600 mb-3">You've successfully RSVP'd for <strong>${escHtml(title)}</strong>.</p>
+      ${successHero}
       ${event ? `<p class="text-gray-500 text-sm mb-4 flex items-center justify-center gap-1.5">${icon('clock', 'w-4 h-4')} ${formatDateTime(event.start_time, event.timezone)} &ndash; ${formatDateTime(event.end_time, event.timezone)}</p>` : ''}
       
       <div class="flex justify-center mb-6">
@@ -4911,7 +5333,7 @@ function buildGuestsCsv(guests: Guest[], timezone: string): string {
 // Shared: event form fields helper
 // ---------------------------------------------------------------------------
 
-function eventFormFields(ev?: Event): string {
+function eventFormFields(ev?: Event, listings: InventoryListing[] = []): string {
   const timezones = [
     'America/New_York',
     'America/Chicago',
@@ -4952,8 +5374,33 @@ function eventFormFields(ev?: Event): string {
     return fromUtc(iso, timezone);
   };
 
+  const listingOptions = listings.map((listing) => {
+    const snapshot = listingSnapshot(listing);
+    const selected = ev?.listing_id === listing.id;
+    const needsDetails = !snapshot.address || !snapshot.agentName || !snapshot.agentEmail;
+    const status = String(listing.data?.listingStatus || listing.status || '').trim();
+    const label = `${snapshot.address || listing.name}${status ? ` — ${status}` : ''}${needsDetails ? ' — details needed' : ''}`;
+    return `<option value="${escAttr(listing.id)}"${selected ? ' selected' : ''}
+      data-address="${escAttr(snapshot.address)}"
+      data-agent-name="${escAttr(snapshot.agentName)}"
+      data-agent-email="${escAttr(snapshot.agentEmail)}"
+      data-agent-phone="${escAttr(snapshot.agentPhone || '')}"
+      data-listing-url="${escAttr(snapshot.listingUrl || '')}">${escHtml(label)}<\/option>`;
+  }).join('');
+  const legacyOption = ev && !ev.listing_id
+    ? `<option value="" selected>Manual event — not linked to Inventory<\/option>`
+    : `<option value="">Manual event / listing not in Inventory<\/option>`;
+
   return `
   <div class="grid grid-cols-1 gap-4">
+    <div>
+      <label class="block text-sm font-medium text-gray-700 mb-1">Inventory Listing <span class="font-normal text-gray-500">(optional)<\/span><\/label>
+      <select id="inventory-listing-select" name="listing_id"
+        class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        ${legacyOption}${listingOptions}
+      <\/select>
+      <p class="mt-1 text-xs text-gray-500">Selecting a listing prefills the event. You can edit the copied details, or leave this unselected for a manual event.<\/p>
+    <\/div>
     <div>
       <label class="block text-sm font-medium text-gray-700 mb-1">Event Title <span class="text-red-500">*<\/span><\/label>
       <input type="text" name="title" required value="${escAttr(ev?.title ?? '')}"
@@ -4961,25 +5408,25 @@ function eventFormFields(ev?: Event): string {
     <\/div>
     <div>
       <label class="block text-sm font-medium text-gray-700 mb-1">Property Address <span class="text-red-500">*<\/span><\/label>
-      <input type="text" name="property_address" required value="${escAttr(ev?.property_address ?? '')}"
+      <input id="inventory-property-address" type="text" name="property_address" required value="${escAttr(ev?.property_address ?? '')}"
         class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
     <\/div>
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Agent Name <span class="text-red-500">*<\/span><\/label>
-        <input type="text" name="agent_name" required value="${escAttr(ev?.agent_name ?? '')}"
+        <input id="inventory-agent-name" type="text" name="agent_name" required value="${escAttr(ev?.agent_name ?? '')}"
           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
       <\/div>
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Agent Email <span class="text-red-500">*<\/span><\/label>
-        <input type="email" name="agent_email" required value="${escAttr(ev?.agent_email ?? '')}"
+        <input id="inventory-agent-email" type="email" name="agent_email" required value="${escAttr(ev?.agent_email ?? '')}"
           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
       <\/div>
     <\/div>
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Agent Phone<\/label>
-        <input type="tel" name="agent_phone" value="${escAttr(ev?.agent_phone ?? '')}"
+        <input id="inventory-agent-phone" type="tel" name="agent_phone" value="${escAttr(ev?.agent_phone ?? '')}"
           class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
       <\/div>
       <div>
@@ -5009,7 +5456,7 @@ function eventFormFields(ev?: Event): string {
     <\/div>
     <div>
       <label class="block text-sm font-medium text-gray-700 mb-1">Listing URL<\/label>
-      <input type="url" name="listing_url" value="${escAttr(ev?.listing_url ?? '')}"
+      <input id="inventory-listing-url" type="url" name="listing_url" value="${escAttr(ev?.listing_url ?? '')}"
         placeholder="https:\/\/..."
         class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" \/>
     <\/div>
@@ -5018,7 +5465,28 @@ function eventFormFields(ev?: Event): string {
       <textarea name="description" rows="3"
         class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">${escHtml(ev?.description ?? '')}<\/textarea>
     <\/div>
-  <\/div>`;
+  <\/div>
+  <script>
+  (function() {
+    var select = document.getElementById('inventory-listing-select');
+    if (!select) return;
+    var fields = {
+      address: document.getElementById('inventory-property-address'),
+      agentName: document.getElementById('inventory-agent-name'),
+      agentEmail: document.getElementById('inventory-agent-email'),
+      agentPhone: document.getElementById('inventory-agent-phone'),
+      listingUrl: document.getElementById('inventory-listing-url')
+    };
+    select.addEventListener('change', function() {
+      var option = select.options[select.selectedIndex];
+      fields.address.value = option ? option.dataset.address || '' : '';
+      fields.agentName.value = option ? option.dataset.agentName || '' : '';
+      fields.agentEmail.value = option ? option.dataset.agentEmail || '' : '';
+      fields.agentPhone.value = option ? option.dataset.agentPhone || '' : '';
+      fields.listingUrl.value = option ? option.dataset.listingUrl || '' : '';
+    });
+  })();
+  <\/script>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -5049,4 +5517,8 @@ function equalHousingLogo(classes = ''): string {
   <\/div>`;
 }
 
-export default app;
+export default Object.assign(app, {
+  async scheduled(_event: ScheduledController, env: Bindings): Promise<void> {
+    await replayAttendance(env);
+  },
+});

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import worker from '../index';
-import { SqliteD1 } from './helpers/d1';
+import { SqliteD1, TEST_LISTING_ID, mockInventory } from './helpers/d1';
 import { MockR2Bucket } from './helpers/r2';
 import { createSession } from '../lib/sessions';
 
@@ -32,6 +32,7 @@ async function makeEnv(db: SqliteD1, bucket: MockR2Bucket): Promise<Record<strin
     WORKSPACE_URL: WORKSPACE,
     ADMIN_TENANT_ID: 'tenant_primeamerica',
     CONTAINMENT_ENABLED: 'false',
+    INVENTORY: mockInventory(),
   };
 }
 
@@ -278,7 +279,7 @@ describe('R2 consistency: delete failure / retry matrix', () => {
   });
 
   it('a delete cannot remove a still-referenced object (refcount guard)', async () => {
-    // Re-reference the object on another event's column to simulate a replace.
+    // Re-reference the object on another event's column to simulate a replace / cloned event.
     db.query('UPDATE events SET agent_photo_2_key = ? WHERE id = ?', OLD_KEY, 'evt_1');
     bucket.deleteFailKeys.clear();
 
@@ -286,10 +287,10 @@ describe('R2 consistency: delete failure / retry matrix', () => {
       method: 'POST',
       headers: await authHeaders(db, token),
     });
-    expect(res.status).toBe(500);
-    // The delete op is blocked (KEY_REFERENCED); the object survives.
+    expect(res.status).toBe(302);
     const ops = mediaOps(db);
-    expect(ops[0].error_code).toBe('KEY_REFERENCED');
+    expect(ops[0].status).toBe('done');
+    // The object survives in bucket because it is still referenced.
     expect(bucket.store.has(OLD_KEY)).toBe(true);
   });
 
@@ -770,6 +771,7 @@ describe('mutation error logging sanitization', () => {
       headers: { ...(await authHeaders(db, token)), 'Content-Type': 'application/x-www-form-urlencoded' },
       body: [
         'title=New+Event',
+        `listing_id=${TEST_LISTING_ID}`,
         'property_address=9+Oak+St',
         'agent_name=Bob',
         'agent_email=bob%40example.com',
